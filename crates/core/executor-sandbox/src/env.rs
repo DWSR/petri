@@ -46,6 +46,7 @@ const MKDIR_TIMEOUT: Duration = Duration::from_secs(30);
 /// One live sandbox, handed to step kinds as their spawn capability.
 pub(crate) struct SandboxEnv {
     pub(crate) host:         bool,
+    pub(crate) masker:       executor::Masker,
     pub(crate) sandbox:      Arc<dyn Sandbox>,
     /// The workspace as the sandbox sees it: its working directory.
     pub(crate) workspace:    String,
@@ -160,6 +161,7 @@ fn spawn_streamed(
     stdin: bool,
     output: OutputMode,
     admission: Admission,
+    masker: executor::Masker,
 ) -> SandboxProcess {
     // Stdin: a piped step gets a writer whose read half streams into the
     // command for its whole life.
@@ -247,7 +249,7 @@ fn spawn_streamed(
         }
         let status: Result<ExitStatus, String> = match outcome {
             Ok(streaming) => streaming_exit_status(&streaming),
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(masker.mask(&error.to_string())),
         };
         let _ = status_tx.send(Some(status));
         drop(admission);
@@ -294,8 +296,8 @@ async fn pump_bytes(
 }
 
 /// Maps a facet failure to the executor's error.
-fn facet_error(operation: &str, error: &DriverError) -> EnvError {
-    EnvError::backend(BACKEND, operation, error.to_string())
+fn facet_error(masker: &executor::Masker, operation: &str, error: &DriverError) -> EnvError {
+    EnvError::backend(BACKEND, operation, masker.mask(&error.to_string()))
 }
 
 #[async_trait]
@@ -315,7 +317,7 @@ impl ExecEnv for SandboxEnv {
                 .exec()
                 .run(&mkdir)
                 .await
-                .map_err(|error| facet_error("mkdir", &error))?;
+                .map_err(|error| facet_error(&self.masker, "mkdir", &error))?;
             if !result.success() {
                 return Err(EnvError::backend(
                     BACKEND,
@@ -358,6 +360,7 @@ impl ExecEnv for SandboxEnv {
             stdin,
             spec.output,
             admission,
+            self.masker.clone(),
         )))
     }
 
@@ -395,7 +398,7 @@ impl ExecEnv for SandboxEnv {
         let preview = previews
             .preview_url(port)
             .await
-            .map_err(|error| facet_error("preview_url", &error))?;
+            .map_err(|error| facet_error(&self.masker, "preview_url", &error))?;
         Ok(Some(PreviewUrl {
             url:     preview.url,
             headers: preview.headers,
@@ -408,7 +411,7 @@ impl ExecEnv for SandboxEnv {
             Some(previews) => previews
                 .release_preview_url(port)
                 .await
-                .map_err(|error| facet_error("release_preview_url", &error)),
+                .map_err(|error| facet_error(&self.masker, "release_preview_url", &error)),
             None => Ok(()),
         }
     }
@@ -418,7 +421,7 @@ impl ExecEnv for SandboxEnv {
         match self.sandbox.fs().read(&relative.to_string_lossy()).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(DriverError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(facet_error("read", &error)),
+            Err(error) => Err(facet_error(&self.masker, "read", &error)),
         }
     }
 
@@ -444,7 +447,7 @@ impl ExecEnv for SandboxEnv {
             )),
             Ok(bytes) => Ok(Some(bytes)),
             Err(DriverError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(facet_error("read", &error)),
+            Err(error) => Err(facet_error(&self.masker, "read", &error)),
         }
     }
 
@@ -454,7 +457,7 @@ impl ExecEnv for SandboxEnv {
             .fs()
             .write(&relative.to_string_lossy(), contents)
             .await
-            .map_err(|error| facet_error("write", &error))
+            .map_err(|error| facet_error(&self.masker, "write", &error))
     }
 
     async fn list_directory(
@@ -481,7 +484,7 @@ impl ExecEnv for SandboxEnv {
                     })
                     .collect()
             })
-            .map_err(|error| facet_error("list_directory", &error))
+            .map_err(|error| facet_error(&self.masker, "list_directory", &error))
     }
 
     fn grace(&self) -> Duration {
@@ -557,6 +560,7 @@ impl ProcessHandle for SandboxProcess {
 /// which shares the sandbox's workspace and network namespace, streams
 /// through the same pumps, and is ended by the sandbox's stop and delete.
 pub(crate) struct OneShotRunner {
+    pub(crate) masker:       executor::Masker,
     pub(crate) sandbox:      Arc<dyn Sandbox>,
     pub(crate) workspace:    String,
     pub(crate) host_address: Option<String>,
@@ -618,6 +622,7 @@ impl OneShotRunner {
             false,
             OutputMode::Lines,
             admission,
+            self.masker.clone(),
         )))
     }
 }
@@ -815,6 +820,7 @@ mod tests {
             false,
             OutputMode::Lines,
             admission,
+            executor::Masker::new(),
         );
         let mut lines = process.lines().expect("a lines stream");
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());

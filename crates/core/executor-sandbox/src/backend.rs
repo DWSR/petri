@@ -7,12 +7,27 @@ use std::str::FromStr;
 
 use executor::EnvError;
 use ir::RuntimeSpec;
-use sandbox_driver::{NetworkPolicy, Resources, SandboxKind};
+use sandbox_driver::{NetworkPolicy, ProviderKind, Resources, SandboxKind};
+
+use crate::registration::validate_kind;
 
 const RUNNER_PIN: &str = "f8bbbfd81934";
 const DEFAULT_LABEL: &str = "ubuntu-24.04";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
+mod provider_selection_tests {
+    use super::SandboxBackend;
+
+    #[test]
+    fn custom_provider_selection_preserves_its_name() {
+        let backend: SandboxBackend = "fixture-provider".parse().expect("valid provider kind");
+        assert_eq!(backend.to_string(), "fixture-provider");
+        assert!("../plugin".parse::<SandboxBackend>().is_err());
+        assert!("simulated".parse::<SandboxBackend>().is_err());
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SandboxBackend {
     /// Local processes, with Docker for explicit container targets.
     #[default]
@@ -21,6 +36,8 @@ pub enum SandboxBackend {
     Docker,
     /// A Daytona sandbox, with a nested job container when requested.
     Daytona,
+    /// Ordinary process scopes on an explicitly registered provider.
+    Registered(ProviderKind),
 }
 
 impl fmt::Display for SandboxBackend {
@@ -29,6 +46,7 @@ impl fmt::Display for SandboxBackend {
             Self::Host => "host",
             Self::Docker => "docker",
             Self::Daytona => "daytona",
+            Self::Registered(kind) => kind.as_str(),
         })
     }
 }
@@ -41,9 +59,9 @@ impl FromStr for SandboxBackend {
             "host" => Ok(Self::Host),
             "docker" => Ok(Self::Docker),
             "daytona" => Ok(Self::Daytona),
-            _ => Err(format!(
-                "unknown backend {value:?}; expected host, docker, or daytona"
-            )),
+            _ => validate_kind(value)
+                .map(Self::Registered)
+                .map_err(|error| error.to_string()),
         }
     }
 }

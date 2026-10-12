@@ -346,7 +346,7 @@ Host jobs inherit `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`,
 `TMPDIR`, `GOPATH`, `CARGO_HOME`, and `NVM_DIR`. Pass other values and secrets
 explicitly through workflow environment settings.
 
-`petri run --backend host|docker|daytona` selects the execution backend.
+`petri run --backend host|docker|daytona|<registered-kind>` selects the execution backend.
 Host is the default, unless the workflow's own configuration asks for another
 (a Fabro `workflow.toml` `[environments.<id>] provider`, read back from the
 lowered graph through `Frontend::launch_settings`; `petri resume` finds the
@@ -358,6 +358,14 @@ selects a VM when the account supports it. `--runner-image LABEL=IMAGE` override
 runner label. Docker defaults cover Ubuntu 22.04, 24.04, and 26.04. Daytona's
 published Docker-in-Docker default covers Ubuntu 24.04 and `ubuntu-latest`;
 other labels need an override. Unknown or conflicting labels fail at acquire.
+
+Custom providers and mixed linked/plugin runtimes use
+`ProviderRegistration` and `ProviderRegistrations`. The CLI reads explicit
+bindings from `--sandbox-providers <file>` for run, resume, and prune.
+See [registered sandbox providers](crates/core/executor-sandbox/PROVIDERS.md)
+for configuration, namespace identity, supported process scopes, and the
+protocol test provider. Recovery uses each lease's recorded provider even
+when the current default changes.
 
 Daytona reads its credentials from `DAYTONA_API_KEY` or `DAYTONA_JWT_TOKEN`
 and the SDK's endpoint and organization variables. The CLI and embedded library

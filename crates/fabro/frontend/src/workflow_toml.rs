@@ -911,16 +911,18 @@ impl Reader<'_> {
             .and_then(toml::Value::as_str)
             .unwrap_or("")
             .to_string();
-        if !matches!(provider.as_str(), "local" | "docker" | "daytona") {
+        if provider == "simulated"
+            || sandbox_driver::ProviderKind::try_new(provider.as_str()).is_err()
+        {
             let source = at(&format!("{base_table}.provider"));
             self.unsupported_in(
                 &source,
                 "workflow_toml.environments.provider",
                 format!(
                     "`[environments.{id}] provider = \"{provider}\"` in `{source}` is not \
-                     `local`, `docker` or `daytona`"
+                     a valid sandbox provider name"
                 ),
-                "set the provider to `local`, `docker` or `daytona`",
+                "use `local`, `docker`, `daytona`, or a registered provider name",
             );
             return;
         }
@@ -932,6 +934,23 @@ impl Reader<'_> {
                 .map(|value| (value, "run.environment"))
                 .or_else(|| base.get(key).map(|value| (value, base_table.as_str())))
         };
+        if !matches!(provider.as_str(), "local" | "host" | "docker" | "daytona") {
+            for key in [
+                "image",
+                "resources",
+                "cwd",
+                "network",
+                "lifecycle",
+                "labels",
+            ] {
+                if let Some((_, table)) = field(key) {
+                    self.unsupported_in(&at(&format!("{table}.{key}")), "workflow_toml.environments.custom",
+                        format!("custom provider `{provider}` does not support environment `{key}` overrides"),
+                        "configure provisioning through the provider registration's process_spec");
+                    return;
+                }
+            }
+        }
         let mut environment = Environment {
             id:        id.clone(),
             provider:  provider.clone(),

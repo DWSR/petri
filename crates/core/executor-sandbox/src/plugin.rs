@@ -1,16 +1,20 @@
 //! Launching, verifying, and supervising sandbox-driver plugins.
 //!
 //! By default Petri reaches every sandbox provider through sandbox-driver's
-//! JSON-RPC plugin protocol, its own first-party providers included; a
-//! third-party provider can only ever be a plugin. An embedder that links the
-//! first-party providers can hand them over in process instead
-//! ([`crate::in_process`]), and no plugin is launched. One [`PluginSettings`]
+//! JSON-RPC plugin protocol, its own first-party providers included. A
+//! registry can also contain linked factories ([`crate::in_process`]); no
+//! plugin is launched for those bindings. One [`PluginSettings`]
 //! per provider kind says where the executable is, what its checksum must be,
 //! and what a sandbox uses to reach services on this machine; one
 //! [`PluginSupervisor`] per kind owns the running process.
 //!
 //! # Resolution and trust
 //!
+//! Explicit registrations use [`PluginSettings::try_new`] with a supplied
+//! executable path, arguments, environment, and checksum or development
+//! policy. They do not read ambient configuration or search for a binary.
+//!
+//! For standalone first-party defaults, resolution works as follows.
 //! The executable is `PETRI_SANDBOX_<KIND>_PLUGIN` when set, else
 //! `sandbox-driver-<kind>` beside Petri's own executable (a release bundle),
 //! else `sandbox-driver-<kind>` on `PATH`. Its SHA-256 must match the
@@ -49,16 +53,18 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{env, fmt};
 
-use executor::EnvError;
+use executor::{EnvError, Masker};
 use sandbox_driver::{ProviderHealth, ProviderKind, SandboxProvider};
 use sandbox_driver_protocol::discovery::PluginConfig;
 use sandbox_driver_protocol::{PluginGeneration, PluginSupervisor};
 use tokio::sync::OnceCell;
 
-use crate::{DOCKER_HOST_ALIAS, fingerprint};
+use crate::registration::{is_builtin, validate_kind};
+use crate::{DOCKER_HOST_ALIAS, NamespacePolicy, ProviderNetwork, RegistrationError, fingerprint};
 
 /// The naming prefix plugin discovery searches `PATH` for:
 /// `sandbox-driver-<kind>`.
@@ -150,6 +156,9 @@ pub struct PluginSettings {
     path:         Option<PathBuf>,
     sha256:       Option<String>,
     dev:          bool,
+    args:         Vec<String>,
+    explicit:     bool,
+    namespace:    Option<NamespacePolicy>,
     host_address: Option<String>,
     env:          BTreeMap<String, String>,
     /// A non-secret description of the backend the plugin will drive, from
@@ -167,14 +176,109 @@ impl fmt::Debug for PluginSettings {
             .field("path", &self.path)
             .field("sha256", &self.sha256)
             .field("dev", &self.dev)
+            .field("argument_count", &self.args.len())
             .field("host_address", &self.host_address)
             .field("env_keys", &self.env.keys())
-            .field("fingerprint", &self.fingerprint)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl PluginSettings {
+    /// Frozen launch inputs supplied by an embedder. This path reads no
+    /// ambient environment and requires an absolute executable path. Callers
+    /// resolve relative paths before registration.
+    pub fn try_new(config: PluginConfig) -> Result<Self, RegistrationError> {
+        validate_kind(config.kind.as_str())?;
+        let invalid = RegistrationError::InvalidLaunch;
+        let path = config
+            .path
+            .as_ref()
+            .ok_or_else(|| invalid("executable path is required"))?;
+        if path.as_os_str().is_empty() || path.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err(invalid("invalid executable path"));
+        }
+        if !path.is_absolute() {
+            return Err(invalid(
+                "resolve the executable to an absolute path before registration",
+            ));
+        }
+        if !config.inherit_env.is_empty() {
+            return Err(invalid(
+                "resolve inherited environment values before passing them to Petri",
+            ));
+        }
+        if config
+            .sha256
+            .as_ref()
+            .is_some_and(|pin| pin.len() != 64 || !pin.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(invalid("sha256 must contain 64 hexadecimal digits"));
+        }
+        if config.sha256.is_none() && !config.dev {
+            return Err(invalid(
+                "provide sha256 or explicitly enable development mode",
+            ));
+        }
+        if config.args.iter().any(|arg| arg.contains('\0'))
+            || config.env.iter().any(|(key, value)| {
+                key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')
+            })
+        {
+            return Err(invalid("invalid argument or environment entry"));
+        }
+        let fingerprint = fingerprint_for(config.kind.as_str(), &config.env);
+        let namespace =
+            (!is_builtin(config.kind.as_str())).then_some(NamespacePolicy::HealthIdentity);
+        Ok(Self {
+            kind: config.kind,
+            path: config.path,
+            sha256: config.sha256,
+            dev: config.dev,
+            args: config.args,
+            explicit: true,
+            namespace,
+            host_address: None,
+            env: config.env,
+            fingerprint,
+        })
+    }
+
+    pub(crate) fn with_namespace(mut self, namespace: NamespacePolicy) -> Self {
+        self.namespace = Some(namespace);
+        self
+    }
+
+    pub(crate) fn network(&self) -> ProviderNetwork {
+        if is_builtin(self.kind.as_str()) {
+            ProviderNetwork::from_parts(
+                self.host_address().map_err(|error| error.to_string()),
+                self.supports_host_workspace(),
+            )
+        } else {
+            ProviderNetwork::new(None, false)
+        }
+    }
+
+    /// Project plugin failures without exposing its supplied launch values.
+    pub(crate) fn redact(&self, message: &str) -> String {
+        self.masker().mask(message)
+    }
+
+    fn masker(&self) -> Masker {
+        let masker = Masker::new();
+        self.register_masks(&masker);
+        masker
+    }
+
+    pub(crate) fn register_masks(&self, masker: &Masker) {
+        if !self.explicit {
+            return;
+        }
+        for value in self.env.values().chain(&self.args) {
+            masker.register_explicit(value);
+        }
+    }
+
     /// The settings for `kind` from this process's environment: the
     /// resolution order, pin, dev flag, and host address documented at the
     /// module level. `dev_override` is the CLI flag; `None` reads the
@@ -212,6 +316,9 @@ impl PluginSettings {
             path,
             sha256,
             dev,
+            args: Vec::new(),
+            explicit: false,
+            namespace: None,
             host_address,
             env,
             fingerprint,
@@ -249,12 +356,14 @@ impl PluginSettings {
     }
 
     fn effective_fingerprint(&self, health: &ProviderHealth) -> Result<String, PluginError> {
-        fingerprint::verified(self.kind.as_str(), &self.fingerprint, health).map_err(|error| {
-            PluginError::Unhealthy {
-                kind:    self.kind.to_string(),
-                status:  "without a verified resource identity",
-                message: error.to_string(),
-            }
+        let fingerprint = match &self.namespace {
+            Some(policy) => fingerprint::custom(self.kind.as_str(), policy, health),
+            None => fingerprint::verified(self.kind.as_str(), &self.fingerprint, health),
+        };
+        fingerprint.map_err(|error| PluginError::Unhealthy {
+            kind:    self.kind.to_string(),
+            status:  "without a verified resource identity",
+            message: error.to_string(),
         })
     }
 
@@ -295,6 +404,7 @@ impl PluginSettings {
             config.dev = true;
         }
         config.env.clone_from(&self.env);
+        config.args.clone_from(&self.args);
         Ok(config)
     }
 }
@@ -372,6 +482,7 @@ pub struct PluginSource {
     /// Filled once the first generation verifies its resource namespace.
     /// The supervisor refuses a later generation that names another.
     fingerprint: OnceLock<String>,
+    closed:      AtomicBool,
 }
 
 impl PluginSource {
@@ -380,6 +491,7 @@ impl PluginSource {
             settings,
             supervisor: OnceCell::new(),
             fingerprint: OnceLock::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -395,11 +507,42 @@ impl PluginSource {
     /// after its transport closed. Single-flight: concurrent callers share
     /// one launch, and the next call retries a failed one.
     pub async fn current(&self) -> Result<Arc<PluginGeneration>, PluginError> {
+        self.check_open()?;
         let supervisor = self.supervisor.get_or_try_init(|| self.launch()).await?;
-        supervisor
+        let generation = supervisor
             .current()
             .await
-            .map_err(|source| self.launch_failed(source))
+            .map_err(|source| self.launch_failed(source))?;
+        if let Err(error) = self.check_open() {
+            let _ = supervisor.shutdown().await;
+            return Err(error);
+        }
+        self.verify_kind(&generation)?;
+        Ok(generation)
+    }
+
+    fn check_open(&self) -> Result<(), PluginError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PluginError::Unhealthy {
+                kind:    self.settings.kind.to_string(),
+                status:  "closed",
+                message: "the run has finished".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn verify_kind(&self, generation: &PluginGeneration) -> Result<(), PluginError> {
+        if (self.settings.explicit || !is_builtin(self.settings.kind.as_str()))
+            && generation.provider().kind() != self.settings.kind()
+        {
+            return Err(PluginError::Unhealthy {
+                kind:    self.settings.kind.to_string(),
+                status:  "with a different provider kind",
+                message: "the executable must declare the registered provider kind".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Launches the supervisor and its first generation, and verifies the
@@ -413,7 +556,10 @@ impl PluginSource {
             .current()
             .await
             .map_err(|source| self.launch_failed(source))?;
-        match self.settings.effective_fingerprint(first.health()) {
+        let fingerprint = self
+            .verify_kind(&first)
+            .and_then(|()| self.settings.effective_fingerprint(first.health()));
+        match fingerprint {
             Ok(fingerprint) => {
                 let _ = self.fingerprint.set(fingerprint);
                 Ok(supervisor)
@@ -426,6 +572,11 @@ impl PluginSource {
     }
 
     fn launch_failed(&self, source: sandbox_driver::Error) -> PluginError {
+        let source = if self.settings.explicit {
+            sandbox_driver::Error::invalid_spec("plugin", self.settings.redact(&source.to_string()))
+        } else {
+            source
+        };
         PluginError::Launch {
             kind:   self.settings.kind.to_string(),
             source: Box::new(source),
@@ -434,10 +585,11 @@ impl PluginSource {
 
     /// Asks the live plugin, if any, to exit.
     pub async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
         if let Some(supervisor) = self.supervisor.get()
             && let Err(error) = supervisor.shutdown().await
         {
-            tracing::debug!(error = %error, "sandbox plugin shutdown failed");
+            tracing::debug!(error = %self.settings.redact(&error.to_string()), "sandbox plugin shutdown failed");
         }
     }
 }
@@ -446,6 +598,11 @@ impl PluginSource {
 /// production, a fixed provider in tests.
 #[async_trait::async_trait]
 pub trait ProviderSource: Send + Sync {
+    /// Launch values that must not appear in Petri's diagnostics.
+    fn masker(&self) -> Masker {
+        Masker::new()
+    }
+
     /// The provider to use now and the generation it belongs to. A
     /// generation change means every handle from before it is dead.
     async fn current(&self) -> Result<(Arc<dyn SandboxProvider>, u64), EnvError>;
@@ -474,8 +631,24 @@ pub trait ProviderSource: Send + Sync {
     }
 }
 
+pub(crate) fn mask_error(source: &dyn ProviderSource, mut error: EnvError) -> EnvError {
+    let masker = source.masker();
+    match &mut error {
+        EnvError::Backend { message, .. } | EnvError::Store { message } => {
+            *message = masker.mask(message);
+        }
+        EnvError::FenceLeaked { detail } => *detail = masker.mask(detail),
+        _ => {}
+    }
+    error
+}
+
 #[async_trait::async_trait]
 impl ProviderSource for PluginSource {
+    fn masker(&self) -> Masker {
+        self.settings.masker()
+    }
+
     async fn current(&self) -> Result<(Arc<dyn SandboxProvider>, u64), EnvError> {
         let generation = self.current().await.map_err(PluginError::into_env_error)?;
         let provider: Arc<dyn SandboxProvider> =

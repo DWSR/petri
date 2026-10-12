@@ -15,6 +15,9 @@ workspace = true
 name = "cli"
 
 [dependencies]
+toml.workspace = true
+sandbox-driver.workspace = true
+sandbox-driver-protocol.workspace = true
 execution = { workspace = true }
 runtime = { workspace = true }
 async-trait = { workspace = true }

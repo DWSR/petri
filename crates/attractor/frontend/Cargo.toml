@@ -15,6 +15,7 @@ workspace = true
 name = "frontend_attractor"
 
 [dependencies]
+sandbox-driver.workspace = true
 ir = { workspace = true }
 frontend = { workspace = true }
 minijinja = { workspace = true }

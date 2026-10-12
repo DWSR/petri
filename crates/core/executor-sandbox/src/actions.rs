@@ -290,6 +290,7 @@ impl ContainerRunner for ActionHostRunner {
         let admission = self.gate.admit("one-shot")?;
         let sandbox = host.sandbox().await?;
         let runner = OneShotRunner {
+            masker: executor::Masker::new(),
             sandbox,
             workspace: CONTAINER_WORKSPACE.to_owned(),
             host_address: Some(host.host_address.clone()),

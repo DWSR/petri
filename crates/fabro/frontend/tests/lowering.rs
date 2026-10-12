@@ -141,7 +141,7 @@ fn workflow_toml_sections_warn_or_reject_and_never_pass_silently() {
         "an environment id with no table is refused, as Fabro refuses it"
     );
     assert_eq!(
-        codes("[run.environment]\nid = \"e\"\n[environments.e]\nprovider = \"k8s\"\n"),
+        codes("[run.environment]\nid = \"e\"\n[environments.e]\nprovider = \"bad/k8s\"\n"),
         ["unsupported.workflow_toml.environments.provider"]
     );
     assert_eq!(
@@ -1580,5 +1580,48 @@ fn workflow_secrets_reach_agent_processes_as_references() {
             node(&graph, "a").step.config["env"]["TOKEN"],
             json!({"$secret": "REVIEW_TOKEN"})
         );
+    }
+}
+
+#[test]
+fn custom_environment_names_survive_lowering_and_reject_builtin_provisioning_fields() {
+    let settings =
+        "[run.environment]\nid = 'custom'\n[environments.custom]\nprovider = 'fixture-provider'\n";
+    let text = dot("start -> exit");
+    let input = files(&[("wf/workflow.toml", settings)]);
+    let lowered = load("wf/workflow.fabro", &text, &input, &CompileInputs::new());
+    assert!(
+        !lowered.diagnostics.has_errors(),
+        "{:?}",
+        lowered.diagnostics
+    );
+    let graph = lowered.graph.expect("custom kind lowers");
+    assert_eq!(
+        Fabro::new()
+            .launch_settings(&graph)
+            .sandbox_backend
+            .as_deref(),
+        Some("fixture-provider")
+    );
+    assert!(matches!(
+        graph.scopes[0].runtime.target,
+        ir::RuntimeTarget::HostProcess
+    ));
+    for field in [
+        "image = { docker = 'alpine' }",
+        "resources = { cpu = 2 }",
+        "cwd = '/work'",
+        "network = { mode = 'none' }",
+        "lifecycle = {}",
+        "labels = ['linux']",
+    ] {
+        let settings = format!("{settings}{field}\n");
+        let input = files(&[("wf/workflow.toml", &settings)]);
+        let lowered = load("wf/workflow.fabro", &text, &input, &CompileInputs::new());
+        assert!(
+            lowered.diagnostics.has_errors(),
+            "silently accepted {field}"
+        );
+        assert!(lowered.graph.is_none());
     }
 }

@@ -25,8 +25,9 @@ mod logging {
     use std::env;
     use std::io::{self, IsTerminal};
 
-    use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::filter::{LevelFilter, filter_fn};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, fmt};
 
     /// The knob, in `tracing-subscriber`'s filter syntax: `PETRI_LOG=info`,
     /// `PETRI_LOG=executor_sandbox=debug`. Deliberately not `RUST_LOG`,
@@ -45,16 +46,28 @@ mod logging {
             .with_default_directive(LevelFilter::WARN.into())
             .with_env_var(FILTER_ENV)
             .from_env_lossy();
-        let builder = tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        let builder = fmt::layer()
             .with_writer(io::stderr)
             .with_ansi(io::stderr().is_terminal());
         // Unset, a warning reads much like the line it replaces. Set, it comes
         // with the timestamp and the target an investigation wants.
-        if configured {
-            builder.compact().init();
+        let output = if configured {
+            builder.compact().boxed()
         } else {
-            builder.without_time().with_target(false).compact().init();
-        }
+            builder.without_time().with_target(false).compact().boxed()
+        };
+        // RPC instrumentation logs raw provider errors before Petri can mask
+        // registration credentials. Report the sanitized executor error even
+        // when an operator enables detailed transport diagnostics.
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(output.with_filter(filter_fn(|metadata| {
+                !(metadata
+                    .target()
+                    .starts_with("sandbox_driver_protocol::client")
+                    || metadata.target() == "sandbox_driver_protocol::discovery"
+                        && metadata.fields().field("error").is_some())
+            })))
+            .init();
     }
 }

@@ -17,6 +17,30 @@
 use std::path::Path;
 
 use sandbox_driver::ProviderHealth;
+use sha2::{Digest as _, Sha256};
+
+use crate::NamespacePolicy;
+
+/// Custom namespaces use a length-delimited encoding, independent of
+/// executable location, credentials, and provider-specific fingerprint seeds.
+pub(crate) fn custom(
+    kind: &str,
+    policy: &NamespacePolicy,
+    health: &ProviderHealth,
+) -> Result<String, MissingIdentity> {
+    let identity = health
+        .identity
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if identity.is_none() && !matches!(policy, NamespacePolicy::Configured(_)) {
+        return Err(MissingIdentity {
+            kind: kind.to_owned(),
+        });
+    }
+    let encoded = serde_json::to_vec(&(kind, policy.configured(), identity))
+        .expect("strings serialize as JSON");
+    Ok(format!("{kind}:namespace-v1:{:x}", Sha256::digest(encoded)))
+}
 
 /// `host:<registry>`: the canonical Host registry directory.
 pub fn host(registry: &Path) -> String {
@@ -52,7 +76,7 @@ pub fn daytona(
 #[derive(Debug, thiserror::Error)]
 #[error(
     "the {kind} provider reports no verified resource identity; its effective \
-     organization must be known before sandbox resources can be created or recovered"
+     resource namespace must be known before sandbox resources can be created or recovered"
 )]
 pub struct MissingIdentity {
     kind: String,

@@ -781,7 +781,15 @@ providers instead hands the runtime a factory per kind
 its own process, launches no plugin (a kind without a factory fails at
 acquire), connects each one once per run and checks its health before any lease
 uses it. Both ways record the same fingerprint for the same backend, so a lease
-recorded one way is recovered or pruned the other. Finishing a run closes its
+recorded one way is recovered or pruned the other. A runtime can combine linked
+and external bindings through `ProviderRegistrations`, with one lazy source per
+validated kind and explicit replacement. Missing bindings never fall back to
+plugin discovery. Custom kinds use a supplied `SandboxSpec` for ordinary process
+scopes; built-in kinds retain their preparation recipes. Custom namespace
+fingerprints combine the kind, configured namespace when present, and health
+identity when present; at least one namespace identity is required. Recovery and
+prune group leases by recorded kind and verify each whole group before mutation
+or orphan sweeping. Finishing a run closes its
 admission to every environment it handed out, so a retained environment
 refuses work afterwards whichever way its provider is reached. The
 durable resource record (one line per transition in the run's resource log,

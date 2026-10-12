@@ -96,7 +96,19 @@ async fn prune_open(run: &RunRuntime, logs: &Arc<dyn RunLogs>) -> Result<PruneRe
         .map(|record| (record.lease, record.workspace.as_str().to_owned()))
         .collect();
     let mut report = PruneReport::default();
+    let recorded: Vec<_> = candidates
+        .iter()
+        .map(|(lease, workspace)| executor_sandbox::RecordedLease {
+            lease:        *lease,
+            workspace_id: workspace.clone(),
+        })
+        .collect();
+    let refused = router.verify_recorded(&recorded).await;
     for (lease, workspace) in candidates {
+        if let Some(problem) = refused.get(&lease) {
+            report.problems.push((lease, problem.clone()));
+            continue;
+        }
         match router.delete_recorded(lease, &workspace).await {
             Ok(ids) if ids.is_empty() => report.clean.push(lease),
             Ok(ids) => report

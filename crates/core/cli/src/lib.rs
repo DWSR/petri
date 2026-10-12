@@ -18,6 +18,7 @@
 pub mod answer;
 pub mod control;
 mod inspect;
+mod providers;
 mod resume;
 mod session;
 #[cfg(test)]
@@ -192,8 +193,12 @@ impl ModelArgs {
 
 #[derive(Args)]
 struct ProviderArgs {
-    /// Where workflow processes run: host, docker, or daytona. Defaults to
-    /// what the workflow's own configuration asks for, else host.
+    /// Provider registrations to use for run, resume, and prune.
+    #[arg(long, value_name = "PATH")]
+    sandbox_providers:  Option<PathBuf>,
+    /// Where workflow processes run: host, docker, daytona, or a registered
+    /// kind. Defaults to what the workflow's own configuration asks for,
+    /// else host.
     #[arg(long)]
     backend:            Option<SandboxBackend>,
     /// Allow plugins without a pinned checksum. Debug builds allow them by
@@ -202,16 +207,29 @@ struct ProviderArgs {
     sandbox_plugin_dev: bool,
 }
 
+#[expect(clippy::print_stderr, reason = "CLI configuration diagnostic")]
+fn provider_error(message: &str) -> ExitCode {
+    eprintln!("sandbox configuration: {message}");
+    ExitCode::FAILURE
+}
+
 impl ProviderArgs {
+    async fn configure(&self, runtime: Runtime) -> Result<Runtime, String> {
+        match &self.sandbox_providers {
+            Some(path) => providers::configure(runtime, path).await,
+            None => Ok(runtime),
+        }
+    }
+
     /// Whether `--backend` was given, so a workflow's own environment does
     /// not override it.
     fn backend_given(&self) -> bool {
         self.backend.is_some()
     }
 
-    fn options(self) -> SandboxOptions {
+    fn options(&self) -> SandboxOptions {
         SandboxOptions {
-            backend: self.backend.unwrap_or_default(),
+            backend: self.backend.clone().unwrap_or_default(),
             plugin_dev: self.sandbox_plugin_dev.then_some(true),
             ..Default::default()
         }
@@ -469,22 +487,27 @@ pub async fn main(make: impl Fn(RuntimeMode) -> Runtime) -> ExitCode {
                 .frontend_for(&target.file, target.format.as_deref())
                 .ok()
                 .map(Frontend::default_retention);
-            let options =
-                session.run_options(&run_dir, default_retention, &launch, provider, runner);
+            let options = match session.run_options(
+                &run_dir,
+                default_retention,
+                &launch,
+                &provider,
+                runner,
+            ) {
+                Ok(options) => options,
+                Err(error) => return provider_error(&error),
+            };
+            let rt = match provider.configure(rt.options(options)).await {
+                Ok(rt) => rt,
+                Err(error) => return provider_error(&error),
+            };
             let answers = session.answers(&launch);
             let session = Session {
                 answers,
                 controls,
                 control_file: session.control.map(|path| (path, TailFrom::Start)),
             };
-            Box::pin(run(
-                &rt.options(options),
-                &target,
-                &run_dir,
-                lowered,
-                session,
-            ))
-            .await
+            Box::pin(run(&rt, &target, &run_dir, lowered, session)).await
         }
         Command::Resume {
             run_dir,
@@ -505,7 +528,14 @@ pub async fn main(make: impl Fn(RuntimeMode) -> Runtime) -> ExitCode {
         Command::Sandbox(SandboxCommand::Prune { run_dir, provider }) => {
             let mut options = RunOptions::new(&run_dir);
             options.sandbox = provider.options();
-            prune(&make(RuntimeMode::Real).options(options)).await
+            let rt = match provider
+                .configure(make(RuntimeMode::Real).options(options))
+                .await
+            {
+                Ok(rt) => rt,
+                Err(error) => return provider_error(&error),
+            };
+            prune(&rt).await
         }
     }
 }

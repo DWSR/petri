@@ -38,6 +38,13 @@ local composite actions; no network (remote action resolution is package 04).
 This is what makes the package property-testable and what keeps GHA's
 peculiarities from leaking into the engine.
 
+Sandbox provider selections are validated names, not a closed built-in enum.
+Frontends preserve custom names for runtime registration lookup; `local` maps
+to `host`. Registration launch settings never enter the graph. Custom providers
+accept process scopes and workflow environment variables. Built-in environment
+image and resource settings must be rejected for custom providers rather than
+silently becoming Docker jobs.
+
 Every frontend emits diagnostics through one shared type:
 
 ```rust

@@ -33,6 +33,7 @@
 //! uses an in-memory one and releases its sandbox at scope release.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use executor::{EnvError, ReleaseReport, Retention, SandboxLeaseId, ScopeOutcome};
@@ -44,7 +45,7 @@ use smol_str::SmolStr;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
-use crate::plugin::ProviderSource;
+use crate::plugin::{ProviderSource, mask_error};
 use crate::run::{LEASE_LABEL, RUN_LABEL, RunIdentity, WORKSPACE_LABEL};
 use crate::{BACKEND, LostSandbox, acquire_failed};
 
@@ -262,12 +263,13 @@ pub(crate) struct LeaseRequest<'a> {
 
 /// One live handle and a holder count per lease, over one provider source.
 pub struct SandboxLeaseManager {
-    source:       Arc<dyn ProviderSource>,
-    ledger:       Arc<dyn LeaseLedger>,
-    identity:     Arc<RunIdentity>,
-    lost_sandbox: LostSandbox,
-    leases:       Mutex<HashMap<SandboxLeaseId, Arc<AsyncMutex<LeaseSlot>>>>,
-    cleanup:      Mutex<JoinSet<()>>,
+    source:            Arc<dyn ProviderSource>,
+    ledger:            Arc<dyn LeaseLedger>,
+    identity:          Arc<RunIdentity>,
+    lost_sandbox:      LostSandbox,
+    leases:            Mutex<HashMap<SandboxLeaseId, Arc<AsyncMutex<LeaseSlot>>>>,
+    cleanup:           Mutex<JoinSet<()>>,
+    namespace_refused: AtomicBool,
 }
 
 impl SandboxLeaseManager {
@@ -283,6 +285,7 @@ impl SandboxLeaseManager {
             lost_sandbox: LostSandbox::Refuse,
             leases: Mutex::new(HashMap::new()),
             cleanup: Mutex::new(JoinSet::new()),
+            namespace_refused: AtomicBool::new(false),
         }
     }
 
@@ -329,6 +332,13 @@ impl SandboxLeaseManager {
     where
         Fut: Future<Output = Result<SandboxSpec, EnvError>> + Send,
     {
+        if self.namespace_refused.load(Ordering::Acquire) {
+            return Err(EnvError::backend(
+                BACKEND,
+                "acquire",
+                "this provider's recorded namespace did not verify; refusing new work",
+            ));
+        }
         // An owned guard: a create hands it to its task, so an acquire that
         // is dropped mid-create still keeps the lease locked until the
         // create has settled one way or the other.
@@ -520,6 +530,27 @@ impl SandboxLeaseManager {
         lease: SandboxLeaseId,
         record: &LeaseRecord,
     ) -> Result<(), EnvError> {
+        if record
+            .provider
+            .as_deref()
+            .is_some_and(|kind| kind != self.source.kind())
+        {
+            return Err(EnvError::backend(
+                BACKEND,
+                "acquire",
+                format!("lease {lease} belongs to another provider"),
+            ));
+        }
+        if record.fingerprint.is_none()
+            && (record.resource_id.is_some()
+                || matches!(record.state, LeaseState::Live | LeaseState::Stopped))
+        {
+            return Err(EnvError::backend(
+                BACKEND,
+                "acquire",
+                format!("lease {lease} has no verified resource namespace"),
+            ));
+        }
         if let Some(recorded) = &record.fingerprint {
             let current = self.source.fingerprint();
             if recorded.as_str() != current {
@@ -528,8 +559,7 @@ impl SandboxLeaseManager {
                     "acquire",
                     format!(
                         "sandbox lease {lease} was allocated on `{recorded}` but this run is \
-                         configured for `{current}`; a changed DOCKER_HOST, Daytona \
-                         organization or target must be restored before the run continues"
+                         configured for `{current}`; restore the recorded provider namespace before the run continues"
                     ),
                 ));
             }
@@ -725,6 +755,22 @@ impl SandboxLeaseManager {
         lease: SandboxLeaseId,
         retention: Retention,
         outcome: ScopeOutcome,
+        slot: OwnedMutexGuard<LeaseSlot>,
+    ) -> ReleaseReport {
+        let mut report = self
+            .release_locked_inner(lease, retention, outcome, slot)
+            .await;
+        for problem in &mut report.problems {
+            *problem = self.source.masker().mask(problem);
+        }
+        report
+    }
+
+    async fn release_locked_inner(
+        &self,
+        lease: SandboxLeaseId,
+        retention: Retention,
+        outcome: ScopeOutcome,
         mut slot: OwnedMutexGuard<LeaseSlot>,
     ) -> ReleaseReport {
         let report = ReleaseReport::default();
@@ -867,6 +913,16 @@ impl SandboxLeaseManager {
         lease: SandboxLeaseId,
         workspace_id: &str,
     ) -> Result<Vec<SandboxId>, EnvError> {
+        self.delete_recorded_inner(lease, workspace_id)
+            .await
+            .map_err(|error| mask_error(self.source.as_ref(), error))
+    }
+
+    async fn delete_recorded_inner(
+        &self,
+        lease: SandboxLeaseId,
+        workspace_id: &str,
+    ) -> Result<Vec<SandboxId>, EnvError> {
         let slot = self.slot(lease);
         let mut slot = slot.lock().await;
         slot.live = None;
@@ -880,6 +936,17 @@ impl SandboxLeaseManager {
             return Ok(Vec::new());
         };
         if record.state == LeaseState::Deleted {
+            return Ok(Vec::new());
+        }
+        if record.state == LeaseState::Allocating
+            && record.pending.is_none()
+            && record.fingerprint.is_none()
+            && record.resource_id.is_none()
+        {
+            self.ledger
+                .deleted(lease)
+                .await
+                .map_err(|error| Self::ledger_failed(&error))?;
             return Ok(Vec::new());
         }
         let (provider, _) = self.source.current().await?;
@@ -909,6 +976,32 @@ impl SandboxLeaseManager {
         Ok(ids)
     }
 
+    /// Verify the entire provider group before reconciliation or prune can
+    /// mutate anything. A mismatch also fences future acquisitions on this
+    /// manager.
+    pub async fn verify_namespace(&self, leases: &[RecordedLease]) -> Result<(), EnvError> {
+        self.source.current().await?;
+        for recorded in leases {
+            let record = self
+                .ledger
+                .lookup(recorded.lease)
+                .await
+                .map_err(|error| Self::ledger_failed(&error))?
+                .ok_or_else(|| {
+                    EnvError::backend(
+                        BACKEND,
+                        "reconcile",
+                        "a recorded lease is missing from the ledger",
+                    )
+                })?;
+            if let Err(error) = self.check_fingerprint(recorded.lease, &record) {
+                self.namespace_refused.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     /// Reconcile the run's leases with the provider before any create: the
     /// takeover step of a `Write` open. For each lease recorded `allocating`
     /// with a create attempted (a fingerprint), a resource under its
@@ -919,7 +1012,18 @@ impl SandboxLeaseManager {
     /// refused — and is removed. Invariant afterwards: a resource under the
     /// run's labels is named by a live or stopped record.
     pub async fn reconcile(&self, leases: &[RecordedLease]) -> ReconcileReport {
+        let mut report = self.reconcile_inner(leases).await;
+        for problem in &mut report.problems {
+            *problem = self.source.masker().mask(problem);
+        }
+        report
+    }
+
+    async fn reconcile_inner(&self, leases: &[RecordedLease]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
+        if let Err(error) = self.verify_namespace(leases).await {
+            return report.with_problem(error.to_string());
+        }
         let (provider, generation) = match self.source.current().await {
             Ok(current) => current,
             Err(error) => {
@@ -1002,10 +1106,15 @@ impl SandboxLeaseManager {
                 continue;
             };
             let named = match self.ledger.lookup(lease).await {
-                Ok(record) => record.is_some_and(|record| {
+                Ok(Some(record)) => {
+                    if let Err(error) = self.check_fingerprint(lease, &record) {
+                        report.problems.push(error.to_string());
+                        continue;
+                    }
                     record.state != LeaseState::Deleted
                         && record.resource_id.as_deref() == Some(status.id.as_str())
-                }),
+                }
+                Ok(None) => false,
                 Err(error) => {
                     report.problems.push(error.to_string());
                     continue;

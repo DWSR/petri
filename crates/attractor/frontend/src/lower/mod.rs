@@ -503,6 +503,29 @@ impl Ctx<'_> {
         let Some(environment) = self.settings.environment.clone() else {
             return;
         };
+        let provider = environment.sandbox_backend();
+        if provider == "simulated" || sandbox_driver::ProviderKind::try_new(provider).is_err() {
+            self.diags.error(
+                "attractor.environment_provider",
+                Span::file(&self.settings_path()),
+                "invalid environment provider name",
+            );
+            return;
+        }
+        if !matches!(provider, "host" | "docker" | "daytona")
+            && (environment.image.is_some()
+                || environment.cpu_cores.is_some()
+                || environment.memory_mb.is_some()
+                || environment.disk_mb.is_some())
+        {
+            self.diags.unsupported(
+                "attractor.environment_provider",
+                Span::file(&self.settings_path()),
+                "custom providers do not accept built-in image or resource settings",
+                "configure the registered provider's process sandbox specification",
+            );
+            return;
+        }
         let scope = self
             .b
             .graph_mut()
@@ -522,7 +545,7 @@ impl Ctx<'_> {
             }
         }
         if let Some(image) = &environment.image
-            && environment.provider != "local"
+            && !matches!(environment.provider.as_str(), "local" | "host")
         {
             scope.runtime.target = ir::RuntimeTarget::Container {
                 image:       SmolStr::new(image),

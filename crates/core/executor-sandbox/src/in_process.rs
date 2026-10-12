@@ -8,9 +8,9 @@
 //! recovered sandbox once, and applies retention; prune still deletes
 //! through the durable records.
 //!
-//! A router with in-process providers never launches a provider plugin: a
-//! kind with no factory fails routably at acquire. A router without them
-//! reaches every provider through its plugin, as before.
+//! The `InProcessProviders` compatibility API installs only factories: a
+//! missing kind fails routably at acquire. [`crate::ProviderRegistrations`]
+//! can instead mix factories and plugins, including custom provider kinds.
 //!
 //! `InProcessSource` is one factory's provider for one run: connected on
 //! first use and health-checked before it serves, like a plugin's first
@@ -49,14 +49,16 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// before any lease uses it.
 #[async_trait]
 pub trait ProviderFactory: Send + Sync {
-    /// The provider kind leases record: `host`, `docker`, or `daytona`.
+    /// The provider kind leases record. Custom kinds use a process template
+    /// through [`crate::ProviderRegistration::linked`].
     fn kind(&self) -> &str;
 
     /// The non-secret namespace seed, built with the [`fingerprint`]
     /// helpers from the settings as configured, the values the kind's
     /// plugin would find in its environment. Pass an unset value as `None`,
     /// never the default `connect` falls back to: the plugin records the
-    /// unset value, so a resolved default would refuse its leases.
+    /// unset value, so a resolved default would refuse its leases. Custom
+    /// registrations use their namespace policy instead of this seed.
     fn fingerprint_seed(&self, context: &ProviderContext) -> String;
 
     /// Where sandboxes are placed (a Daytona target), when configured.
@@ -116,6 +118,23 @@ pub struct ProviderNetwork {
 }
 
 impl ProviderNetwork {
+    pub(crate) fn from_parts(
+        host_address: Result<Option<String>, String>,
+        supports_host_workspace: bool,
+    ) -> Self {
+        Self {
+            host_address,
+            supports_host_workspace,
+        }
+    }
+    /// Explicit topology, without inferring anything from a provider name.
+    pub fn new(host_address: Option<String>, supports_host_workspace: bool) -> Self {
+        Self {
+            host_address: Ok(host_address),
+            supports_host_workspace,
+        }
+    }
+
     /// Processes on this machine reach it on the loopback.
     pub fn host() -> Self {
         Self::unmounted("host")
@@ -178,6 +197,9 @@ impl fmt::Debug for InProcessProviders {
 }
 
 impl InProcessProviders {
+    pub(crate) fn into_factories(self) -> BTreeMap<String, Arc<dyn ProviderFactory>> {
+        self.factories
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -191,6 +213,7 @@ impl InProcessProviders {
     }
 
     /// The factory for `kind`.
+    #[cfg(test)]
     pub(crate) fn factory(&self, kind: &str) -> Result<Arc<dyn ProviderFactory>, String> {
         self.factories.get(kind).cloned().ok_or_else(|| {
             format!(
@@ -219,6 +242,7 @@ pub(crate) struct InProcessSource {
     factory:   Arc<dyn ProviderFactory>,
     context:   ProviderContext,
     seed:      String,
+    namespace: Option<crate::NamespacePolicy>,
     /// The provider and the fingerprint its first health report verified.
     connected: OnceCell<(Arc<dyn SandboxProvider>, String)>,
     closed:    AtomicBool,
@@ -231,9 +255,15 @@ impl InProcessSource {
             factory,
             context,
             seed,
+            namespace: None,
             connected: OnceCell::new(),
             closed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_namespace(mut self, namespace: crate::NamespacePolicy) -> Self {
+        self.namespace = Some(namespace);
+        self
     }
 
     fn error(&self, operation: &str, message: impl fmt::Display) -> EnvError {
@@ -284,8 +314,11 @@ impl InProcessSource {
                 ),
             ));
         }
-        let verified = fingerprint::verified(self.factory.kind(), &self.seed, &health)
-            .map_err(|error| self.error("health", error))?;
+        let verified = match &self.namespace {
+            Some(policy) => fingerprint::custom(self.factory.kind(), policy, &health),
+            None => fingerprint::verified(self.factory.kind(), &self.seed, &health),
+        }
+        .map_err(|error| self.error("health", error))?;
         Ok((provider, verified))
     }
 }

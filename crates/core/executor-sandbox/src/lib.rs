@@ -9,10 +9,10 @@
 //! No provider crate is linked here. A provider is reached one of two ways:
 //!
 //! - as a plugin process over sandbox-driver's JSON-RPC protocol ([`plugin`]),
-//!   the default, and the only path a third-party provider has;
+//!   the default for standalone Petri;
 //! - as a built-in the embedding application links and hands over through
 //!   [`InProcessProviders`] ([`in_process`]), in which case no plugin is
-//!   launched.
+//!   launched for that binding. [`ProviderRegistrations`] can mix both.
 //!
 //! Both record the same fingerprints ([`fingerprint`]), so a lease recorded
 //! one way is recoverable the other. The [`SimulatedProvider`] is a dry
@@ -35,6 +35,7 @@ pub mod lease;
 pub mod plugin;
 #[cfg(test)]
 mod reconcile_tests;
+mod registration;
 mod routing;
 mod run;
 mod simulated;
@@ -42,6 +43,7 @@ mod simulated;
 mod simulated_tests;
 mod snapshots;
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,7 +76,11 @@ pub use crate::lease::{
     LeaseLedger, LeaseRecord, LeaseState, LedgerError, MemoryLedger, PendingIntent,
     ReconcileReport, RecordedLease, SandboxLeaseManager,
 };
+use crate::plugin::mask_error;
 pub use crate::plugin::{FixedProvider, PluginError, PluginSettings, PluginSource, ProviderSource};
+pub use crate::registration::{
+    NamespacePolicy, ProviderRegistration, ProviderRegistrations, RegistrationError,
+};
 pub use crate::routing::{CONTAINER_KIND, RoutingExecutor};
 use crate::run::workspace_dir;
 pub use crate::run::{LEASE_LABEL, RUN_LABEL, RunIdentity, WORKSPACE_LABEL};
@@ -107,17 +113,20 @@ pub(crate) fn acquire_failed(error: &sandbox_driver::Error) -> EnvError {
 /// lease it lives under, and one live handle serves every holder of that
 /// lease.
 pub struct SandboxExecutor {
-    manager:      Arc<SandboxLeaseManager>,
-    identity:     Arc<RunIdentity>,
-    retention:    Retention,
-    host_address: Option<String>,
-    options:      SandboxOptions,
-    snapshots:    RunnerSnapshots,
+    manager:                 Arc<SandboxLeaseManager>,
+    identity:                Arc<RunIdentity>,
+    retention:               Retention,
+    host_address:            Option<String>,
+    options:                 SandboxOptions,
+    process_spec:            Option<SandboxSpec>,
+    placement_labels:        BTreeSet<String>,
+    supports_host_workspace: bool,
+    snapshots:               RunnerSnapshots,
     /// Every scope is realized on the [`SimulatedProvider`], whatever its
     /// target: a bare spec, no host-process semantics, no route back.
-    simulated:    bool,
+    simulated:               bool,
     /// Admission to the environments this executor hands out.
-    gate:         RunGate,
+    gate:                    RunGate,
 }
 
 impl SandboxExecutor {
@@ -140,6 +149,9 @@ impl SandboxExecutor {
             retention,
             host_address,
             options,
+            process_spec: None,
+            placement_labels: BTreeSet::new(),
+            supports_host_workspace: false,
             snapshots: RunnerSnapshots::default(),
             simulated: false,
             gate: RunGate::default(),
@@ -152,6 +164,60 @@ impl SandboxExecutor {
     pub(crate) fn with_gate(mut self, gate: RunGate) -> Self {
         self.gate = gate;
         self
+    }
+
+    pub(crate) fn with_host_workspace(mut self, supported: bool) -> Self {
+        self.supports_host_workspace = supported;
+        self
+    }
+
+    pub(crate) fn with_process_spec(mut self, spec: SandboxSpec, labels: BTreeSet<String>) -> Self {
+        self.process_spec = Some(spec);
+        self.placement_labels = labels;
+        self
+    }
+
+    fn validate_scope(&self, scope: &ScopeSpec) -> Result<(), EnvError> {
+        if self.process_spec.is_some()
+            && (!matches!(scope.runtime.target, RuntimeTarget::HostProcess)
+                || !scope.services.is_empty()
+                || scope
+                    .runtime
+                    .requirements
+                    .iter()
+                    .any(|label| !self.placement_labels.contains(label.as_str())))
+        {
+            return Err(EnvError::backend(
+                self.manager.source().kind(),
+                "prepare",
+                "registered process providers require ordinary process scopes, no services, and explicitly satisfied placement labels",
+            ));
+        }
+        Ok(())
+    }
+
+    fn network_policy(&self) -> Result<NetworkPolicy, EnvError> {
+        let requested = &self.options.network;
+        let Some(template) = &self.process_spec else {
+            return Ok(requested.clone());
+        };
+        let policy = match (&template.network, requested) {
+            (policy, NetworkPolicy::ProviderDefault)
+            | (NetworkPolicy::ProviderDefault | NetworkPolicy::AllowAll, policy) => policy,
+            (NetworkPolicy::Block, _) | (_, NetworkPolicy::Block) => {
+                return Ok(NetworkPolicy::Block);
+            }
+            (policy, NetworkPolicy::AllowAll) => policy,
+            (policy, other) if policy == other => policy,
+            _ => {
+                return Err(EnvError::backend(
+                    BACKEND,
+                    "prepare",
+                    "template and run network restrictions cannot be combined",
+                ));
+            }
+        };
+        Ok(policy.clone())
     }
 
     /// An executor over the [`SimulatedProvider`] in `source`: what a dry
@@ -188,6 +254,27 @@ impl SandboxExecutor {
         scope: &ScopeSpec,
         ctx: &AcquireContext,
     ) -> Result<EnvHandle, EnvError> {
+        self.validate_scope(scope)?;
+        let network = self.network_policy()?;
+        if self.process_spec.is_some() {
+            let (provider, _) = self.manager.source().current().await?;
+            let caps = &provider.capabilities().network;
+            let supported = match &network {
+                NetworkPolicy::ProviderDefault => true,
+                NetworkPolicy::AllowAll => caps.allow_all,
+                NetworkPolicy::Block => caps.block_all,
+                NetworkPolicy::CidrAllowList { .. } => caps.cidr_allow_list,
+                NetworkPolicy::DomainAllowList { .. } => caps.domain_allow_list,
+                _ => false,
+            };
+            if !supported {
+                return Err(EnvError::backend(
+                    BACKEND,
+                    "prepare",
+                    "the provider cannot enforce the requested network policy",
+                ));
+            }
+        }
         // A coordinator names the lease; a bare driver has none, and its
         // sandbox is the scope's alone, keyed by the scope and ended with it.
         let (lease, standalone) = match ctx.lease() {
@@ -208,7 +295,7 @@ impl SandboxExecutor {
                         .build_spec(scope, &labels, &name, ctx, &*provider)
                         .await?;
                     if !self.simulated {
-                        spec.network = self.options.network.clone();
+                        spec.network = network.clone();
                     }
                     Ok(spec)
                 },
@@ -217,19 +304,25 @@ impl SandboxExecutor {
         let sandbox = acquired.sandbox();
         // A retained sandbox may predate the requested block policy. Check
         // provider state before handing it to hooks or executing any stage.
-        if !self.simulated && self.options.network == NetworkPolicy::Block {
+        let network = self.network_policy()?;
+        if !self.simulated
+            && !matches!(
+                network,
+                NetworkPolicy::ProviderDefault | NetworkPolicy::AllowAll
+            )
+        {
             let status = sandbox
                 .describe()
                 .await
                 .map_err(|error| acquire_failed(&error));
             let verified = status.and_then(|status| {
-                if status.network == Some(NetworkPolicy::Block) {
+                if status.network.as_ref() == Some(&network) {
                     Ok(())
                 } else {
                     Err(EnvError::backend(
                         BACKEND,
                         "acquire",
-                        "the sandbox does not report blocked networking; refusing to execute a blocked run",
+                        if network == NetworkPolicy::Block { "the sandbox does not report blocked networking; refusing to execute" } else { "the sandbox does not report the requested restricted networking; refusing to execute" },
                     ))
                 }
             });
@@ -263,6 +356,7 @@ impl SandboxExecutor {
             && self.options.backend == SandboxBackend::Host
             && matches!(scope.runtime.target, RuntimeTarget::HostProcess);
         let env = SandboxEnv {
+            masker: self.manager.source().masker(),
             host,
             sandbox: sandbox.clone(),
             workspace: workspace.clone(),
@@ -275,6 +369,7 @@ impl SandboxExecutor {
         // Docker actions in this scope run as one-shot containers in the
         // sandbox's world: same workspace, same services, same host alias.
         let runner = OneShotRunner {
+            masker: self.manager.source().masker(),
             sandbox: sandbox.clone(),
             workspace,
             host_address: self.host_address.clone(),
@@ -282,19 +377,23 @@ impl SandboxExecutor {
             gate: self.gate.clone(),
         };
         let teardown = SandboxTeardown {
-            host,
+            provider: self.manager.source().kind().to_owned(),
             sandbox: acquired.into_sandbox(),
             lease,
             standalone,
         };
-        Ok(EnvHandle::new(
+        let handle = EnvHandle::new(
             scope.id,
             SmolStr::new(scope.environment.as_str()),
             instance,
             Arc::new(env),
             teardown,
-        )
-        .with_runner(Arc::new(runner)))
+        );
+        Ok(if self.process_spec.is_some() {
+            handle
+        } else {
+            handle.with_runner(Arc::new(runner))
+        })
     }
 
     /// The record of an acquired sandbox: its provider and id, and what the
@@ -305,7 +404,7 @@ impl SandboxExecutor {
             Ok(status) => (status.image, status.snapshot),
             Err(error) => {
                 tracing::warn!(
-                    error = %error,
+                    error = %self.manager.source().masker().mask(&error.to_string()),
                     sandbox = %sandbox.id(),
                     "the acquired sandbox could not be described; its image is unrecorded"
                 );
@@ -337,6 +436,18 @@ impl SandboxExecutor {
                 .name(name)
                 .working_directory(format!("/{SIMULATED_KIND}/{}", scope.workspace_id));
             spec.labels.extend(labels.iter().cloned());
+            return Ok(spec);
+        }
+        if let Some(template) = &self.process_spec {
+            let mut spec = template.clone();
+            spec.name = Some(name.to_owned());
+            spec.labels.extend(labels.iter().cloned());
+            spec.env.extend(
+                scope
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
+            );
             return Ok(spec);
         }
         if self.options.backend == SandboxBackend::Host
@@ -627,7 +738,7 @@ fn docker_provider_config(
 /// What release needs: the lease the environment held, and whether this
 /// executor alone owns it.
 pub(crate) struct SandboxTeardown {
-    host:       bool,
+    provider:   String,
     sandbox:    Arc<dyn Sandbox>,
     lease:      SandboxLeaseId,
     /// No coordinator named the lease: the sandbox ends with the scope.
@@ -637,7 +748,7 @@ pub(crate) struct SandboxTeardown {
 impl fmt::Debug for SandboxTeardown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SandboxTeardown")
-            .field("host", &self.host)
+            .field("provider", &self.provider)
             .field("sandbox", &self.sandbox.id())
             .field("lease", &self.lease)
             .field("standalone", &self.standalone)
@@ -653,12 +764,14 @@ impl Executor for SandboxExecutor {
         scope: &ScopeSpec,
         ctx: &AcquireContext,
     ) -> Result<EnvHandle, EnvError> {
+        let _admission = self.gate.admit("acquire")?;
         match self.acquire_inner(scope, ctx).await {
             Ok(handle) => {
                 tracing::info!("scope environment acquired");
                 Ok(handle)
             }
             Err(error) => {
+                let error = mask_error(self.manager.source().as_ref(), error);
                 tracing::error!(error = ?error, "scope environment acquire failed");
                 Err(error)
             }

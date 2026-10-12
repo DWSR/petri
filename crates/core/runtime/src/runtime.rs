@@ -20,7 +20,10 @@ use engine::{EngineStart, EventLog, ReplayMismatch};
 use executor::{
     DEFAULT_GRACE, Executor, MapSecrets, Masker, ProgressSink, Retention, SecretProvider,
 };
-use executor_sandbox::{InProcessProviders, LeaseLedger, RoutingExecutor, SandboxOptions};
+use executor_sandbox::{
+    InProcessProviders, LeaseLedger, ProviderRegistration, ProviderRegistrations,
+    RegistrationError, RoutingExecutor, SandboxOptions,
+};
 use frontend::{CompileInputs, DirFiles, FileSource, Frontend, Lowered, REPOSITORY_VAR, Span};
 use ir::{ExecutionId, Graph, InvocationId};
 use serde_json::Value;
@@ -168,8 +171,8 @@ pub struct Runtime {
     /// The standard router acquires every scope on the simulated provider:
     /// a dry run.
     simulated:       bool,
-    /// Built-in providers the standard router reaches instead of plugins.
-    in_process:      Option<InProcessProviders>,
+    /// Explicit linked or external bindings for the standard router.
+    providers:       Option<ProviderRegistrations>,
     sources:         Sources,
 }
 
@@ -249,7 +252,7 @@ impl Runtime {
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
             simulated:       false,
-            in_process:      None,
+            providers:       None,
             sources:         Sources::default(),
         }
     }
@@ -274,7 +277,7 @@ impl Runtime {
                 env::temp_dir().join(format!("petri-run-{}", process::id())),
             ),
             simulated:       false,
-            in_process:      None,
+            providers:       None,
             sources:         Sources::default(),
         }
     }
@@ -373,8 +376,28 @@ impl Runtime {
     /// and [`Runtime::executor`] still replaces the router outright.
     #[must_use]
     pub fn in_process_providers(mut self, providers: InProcessProviders) -> Self {
-        self.in_process = Some(providers);
+        self.providers = Some(providers.into());
         self
+    }
+
+    /// Install linked and external providers together. Missing registrations
+    /// fail explicitly on run, resume, and prune.
+    #[must_use]
+    pub fn sandbox_providers(mut self, providers: ProviderRegistrations) -> Self {
+        self.providers = Some(providers);
+        self
+    }
+
+    /// Add or deliberately override one binding, retaining this runtime's
+    /// configured registry (or standalone first-party plugin defaults).
+    pub fn sandbox_provider(
+        mut self,
+        registration: ProviderRegistration,
+    ) -> Result<Self, RegistrationError> {
+        self.providers
+            .get_or_insert_with(|| ProviderRegistrations::from_env(self.options.sandbox.plugin_dev))
+            .replace(registration)?;
+        Ok(self)
     }
 
     /// Keep every run's durable record in `store` instead of the run
@@ -948,7 +971,11 @@ impl Runtime {
     /// The mask set of the configured `SecretProvider`, for a host that
     /// persists anything beside the run.
     pub fn masker(&self) -> Masker {
-        self.secrets.masker()
+        let masker = self.secrets.masker();
+        if let Some(providers) = &self.providers {
+            providers.register_masks(&masker);
+        }
+        masker
     }
 
     /// Build the standard sandbox router for maintenance without starting
@@ -960,6 +987,8 @@ impl Runtime {
     }
 
     fn default_router_for(&self, run_dir: &Path, key: &RunKey) -> Arc<RoutingExecutor> {
+        // The same mask set is shared by step logs, events, and host reports.
+        let _ = self.masker();
         let router = if self.simulated {
             RoutingExecutor::simulated(run_dir)
         } else {
@@ -968,8 +997,8 @@ impl Runtime {
                 self.options.retention,
                 self.options.sandbox.clone(),
             );
-            match &self.in_process {
-                Some(providers) => router.with_in_process(providers.clone()),
+            match &self.providers {
+                Some(providers) => router.with_providers(providers.clone()),
                 None => router,
             }
         };
