@@ -583,9 +583,10 @@ impl PluginSource {
         }
     }
 
-    /// Asks the live plugin, if any, to exit.
+    /// Asks the live plugin, if any, to exit. A subsequent call can launch
+    /// a replacement. The run-owned [`ProviderSource::shutdown`] also closes
+    /// admission permanently.
     pub async fn shutdown(&self) {
-        self.closed.store(true, Ordering::Release);
         if let Some(supervisor) = self.supervisor.get()
             && let Err(error) = supervisor.shutdown().await
         {
@@ -657,6 +658,7 @@ impl ProviderSource for PluginSource {
     }
 
     async fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
         Self::shutdown(self).await;
     }
 

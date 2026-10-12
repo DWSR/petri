@@ -208,7 +208,7 @@ impl RoutingExecutor {
             return Err(EnvError::backend(
                 kind,
                 "resolve",
-                "a dry run leaves real provider resources untouched",
+                "a dry run launches no provider plugin; real provider resources are left as recorded",
             ));
         }
         let slot = self
@@ -227,9 +227,8 @@ impl RoutingExecutor {
     async fn build_executor(&self, kind: &str) -> Result<Arc<SandboxExecutor>, String> {
         let ledger = self
             .ledger
-            .get()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(MemoryLedger::default()));
+            .get_or_init(|| Arc::new(MemoryLedger::default()))
+            .clone();
         if let Some(source) = self.fixed.as_ref().filter(|source| source.kind() == kind) {
             let executor = if self.simulated {
                 SandboxExecutor::simulated(source.clone(), ledger, self.identity.clone())
@@ -328,6 +327,13 @@ impl RoutingExecutor {
                 format!("lease {lease} has no recorded provider"),
             )
         })?;
+        if kind == SIMULATED_KIND && !self.simulated {
+            return Err(EnvError::backend(
+                SIMULATED_KIND,
+                "lookup",
+                format!("lease {lease} was simulated by a dry run; no provider holds it"),
+            ));
+        }
         self.executor_for_kind(&kind).await
     }
 

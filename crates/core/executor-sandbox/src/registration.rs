@@ -355,7 +355,7 @@ mod tests {
     async fn closing_an_unused_source_never_launches_it_later() {
         let source =
             crate::PluginSource::new(PluginSettings::try_new(config("custom-kind")).unwrap());
-        source.shutdown().await;
+        ProviderSource::shutdown(&source).await;
         let error = source
             .current()
             .await
