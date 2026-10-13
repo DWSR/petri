@@ -1388,7 +1388,7 @@ fn timeouts_lower_to_per_attempt_budgets_with_fabro_defaults() {
 #[test]
 fn timeout_policy_follows_the_handler() {
     let graph = lower_ok(&dot(r#"
-        acp [prompt="x"]
+        acp [prompt="x", backend="acp", acp.command="test-agent"]
         api [prompt="x", backend="api", model="m"]
         p [shape=tab, prompt="say", backend="api", model="m"]
         c [shape=parallelogram, script="true"]
@@ -1406,6 +1406,79 @@ fn timeout_policy_follows_the_handler() {
     assert_eq!(policy("h"), TimeoutPolicy::HandlerManaged);
     assert_eq!(policy("w"), TimeoutPolicy::ExecutorEnforced);
     assert_eq!(policy("start"), TimeoutPolicy::ExecutorEnforced);
+}
+
+/// Timeout ownership must resolve the same backend as dispatch, including
+/// the implicit native API backend and graph/stylesheet overrides.
+#[test]
+fn native_agent_timeout_policy_follows_backend_resolution() {
+    for (graph_attrs, node_attrs, backend, policy) in [
+        ("", "", "api", TimeoutPolicy::ExecutorEnforced),
+        (
+            "",
+            r#"backend="api""#,
+            "api",
+            TimeoutPolicy::ExecutorEnforced,
+        ),
+        (
+            r#"backend="api""#,
+            "",
+            "api",
+            TimeoutPolicy::ExecutorEnforced,
+        ),
+        ("", r#"backend="acp""#, "acp", TimeoutPolicy::HandlerManaged),
+        (r#"backend="acp""#, "", "acp", TimeoutPolicy::HandlerManaged),
+        (
+            r#"backend="acp""#,
+            r#"backend="api""#,
+            "api",
+            TimeoutPolicy::ExecutorEnforced,
+        ),
+        (
+            r#"backend="api""#,
+            r#"backend="acp""#,
+            "acp",
+            TimeoutPolicy::HandlerManaged,
+        ),
+        (
+            r##"backend="acp", model_stylesheet="#a { backend: api; }""##,
+            "",
+            "api",
+            TimeoutPolicy::ExecutorEnforced,
+        ),
+        (
+            r##"model_stylesheet="#a { backend: acp; }""##,
+            "",
+            "acp",
+            TimeoutPolicy::HandlerManaged,
+        ),
+        (
+            r##"model_stylesheet="#a { backend: acp; }""##,
+            r#"backend="api""#,
+            "api",
+            TimeoutPolicy::ExecutorEnforced,
+        ),
+    ] {
+        let graph = lower_ok(&format!(
+            r#"digraph T {{
+            graph [acp.command="test-agent", {graph_attrs}]
+            start [shape=Mdiamond]
+            a [prompt="work", timeout="1s", {node_attrs}]
+            exit [shape=Msquare]
+            start -> a -> exit
+        }}"#
+        ));
+        let agent = node(&graph, "a");
+        assert_eq!(
+            agent.step.config["backend"].as_str().unwrap_or("api"),
+            backend
+        );
+        assert_eq!(
+            agent.budget.timeout_policy, policy,
+            "graph={graph_attrs}, node={node_attrs}"
+        );
+        assert_eq!(agent.budget.timeout, Duration::from_secs(1));
+    }
 }
 
 /// `stall_timeout` and `loop_restart_signature_limit` lower to the graph's

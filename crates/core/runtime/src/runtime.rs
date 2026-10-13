@@ -1084,16 +1084,14 @@ impl RunRuntime {
     }
 
     /// Reconcile the run's recorded leases with their providers before any
-    /// create: the takeover step of a resume. `host` names the leases on the
-    /// host provider and `container` the rest. A no-op under a
-    /// caller-supplied executor.
+    /// create: the takeover step of a resume. Each lease goes to the
+    /// provider its record names. A no-op under a caller-supplied executor.
     pub async fn reconcile_leases(
         &self,
-        host: &[executor_sandbox::RecordedLease],
-        container: &[executor_sandbox::RecordedLease],
+        leases: &[executor_sandbox::RecordedLease],
     ) -> executor_sandbox::ReconcileReport {
         match &self.router {
-            Some(router) => router.reconcile(host, container).await,
+            Some(router) => router.reconcile(leases).await,
             None => executor_sandbox::ReconcileReport::default(),
         }
     }

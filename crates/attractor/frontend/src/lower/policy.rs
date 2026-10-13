@@ -74,6 +74,9 @@ pub(super) fn timeout_policy(kind: Kind, node: &NodeDecl, workflow: &Workflow) -
                 .or_else(|| workflow.attrs.text("backend"));
             match backend.as_deref() {
                 Some("api") => TimeoutPolicy::ExecutorEnforced,
+                // An omitted agent backend dispatches to native API, whose
+                // deadline belongs to the driver rather than the session.
+                None if kind == Kind::Agent => TimeoutPolicy::ExecutorEnforced,
                 _ => TimeoutPolicy::HandlerManaged,
             }
         }

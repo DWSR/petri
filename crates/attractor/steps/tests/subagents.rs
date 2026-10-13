@@ -15,7 +15,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use std::{env, fs, thread};
+use std::{env, fs, process, thread};
 
 use attractor_steps::pebble::PebbleClient;
 use attractor_steps::register;
@@ -39,11 +39,12 @@ use runtime::{RunOptions, Runtime};
 use serde_json::json;
 use smol_str::SmolStr;
 use testkit::{RunDir, output_of};
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
 fn dot(body: &str) -> String {
     format!(
-        "digraph T {{\n  graph [backend=\"api\", default_model=\"test/model\"]\n  start \
+        "digraph T {{\n  graph [default_model=\"test/model\"]\n  start \
          [shape=Mdiamond]\n  exit [shape=Msquare]\n{body}\n}}"
     )
 }
@@ -755,11 +756,31 @@ async fn nested_delegation_reaches_a_grandchild_within_the_open_session_bound() 
 /// tool process, and the stage settles as cancelled.
 #[tokio::test]
 async fn cancelling_the_run_stops_every_descendant() {
+    assert_stops_every_descendant(false).await;
+}
+
+/// The default native backend's deadline must close the child session and
+/// stop both its tool shell and the process that shell launched.
+#[tokio::test]
+async fn a_default_native_deadline_stops_every_descendant() {
+    assert_stops_every_descendant(true).await;
+}
+
+async fn assert_stops_every_descendant(at_deadline: bool) {
     let dir = RunDir::new("subagents-cancel");
-    let marker = format!("petri-subagent-cancel-{}", testkit::unique_id());
+    let marker = format!(
+        "petri-subagent-cancel-{}-{}",
+        process::id(),
+        testkit::unique_id()
+    );
+    let child_marker = format!(
+        "petri-tool-child-{}-{}",
+        process::id(),
+        testkit::unique_id()
+    );
     let waiting = dir.path().join("waiting");
     let command = format!(
-        "touch '{}'; while true; do sleep 0.1; done # {marker}",
+        "sh -c 'touch \"$1\"; while true; do sleep 0.1; done' {child_marker} '{}' & wait # {marker}",
         waiting.display()
     );
     let task = "child: wait forever";
@@ -782,9 +803,11 @@ async fn cancelling_the_run_stops_every_descendant() {
         )],
     );
     let rt = runtime(dir.path(), client, Retention::Never);
-    let driver = rt.driver(graph(&one_agent(""), Vec::new()));
+    let extra = if at_deadline { r#", timeout="3s""# } else { "" };
+    let driver = rt.driver(graph(&one_agent(extra), Vec::new()));
     let handle = driver.handle();
-    let run = tokio::spawn(driver.run());
+    let mut runs = JoinSet::new();
+    runs.spawn(driver.run());
     timeout(Duration::from_secs(15), async {
         while !waiting.exists() {
             sleep(Duration::from_millis(20)).await;
@@ -792,15 +815,24 @@ async fn cancelling_the_run_stops_every_descendant() {
     })
     .await
     .expect("the child's tool started");
-    handle.cancel(CancelScopeId::ROOT).await;
-    let report = timeout(Duration::from_secs(20), run)
+    if !at_deadline {
+        handle.cancel(CancelScopeId::ROOT).await;
+    }
+    let report = timeout(Duration::from_secs(20), runs.join_next())
         .await
         .expect("cancel settles")
+        .expect("run task exists")
         .expect("run task");
-    assert_ne!(report.status, RunStatus::Success);
+    if !at_deadline {
+        assert_ne!(report.status, RunStatus::Success);
+    }
     assert_eq!(
         testkit::status_of(&report, "a").as_deref(),
-        Some("cancelled")
+        Some(if at_deadline {
+            "timed_out"
+        } else {
+            "cancelled"
+        })
     );
     let events = pebble_events(&report);
     assert_eq!(events_of(&events, "SubAgentSpawned").len(), 1);
@@ -812,14 +844,14 @@ async fn cancelling_the_run_stops_every_descendant() {
     // The child's shell loop is gone: nothing carries the marker any more.
     // The plugin's kill is asynchronous to the report; give it a moment.
     for _ in 0..50 {
-        if !process_running(&marker) {
+        if !process_running(&marker) && !process_running(&child_marker) {
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        !process_running(&marker),
-        "the child's tool process was stopped"
+        !process_running(&marker) && !process_running(&child_marker),
+        "the child's tool shell and its descendant were stopped"
     );
 }
 

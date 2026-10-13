@@ -152,26 +152,22 @@ impl Coordinator {
     pub(super) async fn reconcile_leases(&self) {
         // A simulated lease (a dry run's) was never on a provider: there is
         // nothing to adopt and nothing to sweep.
-        let (host, container): (Vec<_>, Vec<_>) = self
+        let leases: Vec<RecordedLease> = self
             .resources()
             .await
             .records()
             .filter(|record| {
                 record.state != crate::LeaseState::Deleted && record.provider != SIMULATED_KIND
             })
-            .map(|record| {
-                (record.provider == HOST_PROVIDER, RecordedLease {
-                    lease:        record.lease,
-                    workspace_id: record.workspace.as_str().to_owned(),
-                })
+            .map(|record| RecordedLease {
+                lease:        record.lease,
+                workspace_id: record.workspace.as_str().to_owned(),
             })
-            .partition::<Vec<_>, _>(|(host, _)| *host);
-        let host: Vec<RecordedLease> = host.into_iter().map(|(_, lease)| lease).collect();
-        let container: Vec<RecordedLease> = container.into_iter().map(|(_, lease)| lease).collect();
-        if host.is_empty() && container.is_empty() {
+            .collect();
+        if leases.is_empty() {
             return;
         }
-        let report = self.runtime.reconcile_leases(&host, &container).await;
+        let report = self.runtime.reconcile_leases(&leases).await;
         for (lease, sandbox) in &report.adopted {
             tracing::info!(lease = lease.raw(), sandbox = %sandbox, "adopted a lost create");
         }

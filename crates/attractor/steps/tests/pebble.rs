@@ -17,8 +17,8 @@ use ir::{CancelScopeId, Graph, RunStatus, ScopeId};
 use lithos_llm::types::{ContentPart, ReasoningEffort};
 use pebble_coding_agent::environment::{Environment, ExecRequest};
 use pebble_coding_agent::test_support::{
-    EnvironmentContract, ScriptedCall, message_text, scripted_client, text_response,
-    tool_call_response,
+    EnvironmentContract, ScriptedCall, ScriptedProvider, client_from, message_text,
+    scripted_client, text_response, tool_call_response,
 };
 use runtime::driver::{
     DeliverDisposition, EventObserver, ExecutionReport, ObserveError, RunHandle,
@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 fn graph(extra: &str) -> Graph {
     let source = format!(
         r#"digraph T {{
-        graph [backend="api", default_model="test/model"]
+        graph [default_model="test/model"]
         start [shape=Mdiamond]
         a [prompt="Make the change and verify it" {extra}]
         exit [shape=Msquare]
@@ -1207,5 +1207,35 @@ async fn native_prompts_omit_absent_context_parts() {
                 "the nonempty preamble remains: {text}"
             );
         }
+    }
+}
+
+/// A backend omitted from the source dispatches to native API and must
+/// enforce the same attempt budget as explicitly selecting that backend.
+#[tokio::test]
+async fn default_and_explicit_native_agents_reject_a_response_after_the_deadline() {
+    for backend in ["", r#", backend="api""#] {
+        let dir = RunDir::new("pebble-delayed-deadline");
+        let (client, provider) = client_from(
+            ScriptedProvider::new(vec![ScriptedCall::response(text_response("too late"))])
+                .delayed(Duration::from_secs(3)),
+        );
+        let report = timeout(
+            Duration::from_secs(15),
+            runtime(&dir, client).run(graph(&format!(r#", timeout="1s"{backend}"#))),
+        )
+        .await
+        .expect("the attempt settles")
+        .expect("replay");
+        assert_eq!(
+            testkit::status_of(&report, "a").as_deref(),
+            Some("timed_out"),
+            "backend={backend}"
+        );
+        assert!(
+            provider.requests().is_empty(),
+            "the delayed call did not finish"
+        );
+        assert_eq!(metrics(&report)["pebble.usage"]["tokens"]["input"], 0);
     }
 }

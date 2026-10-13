@@ -149,6 +149,18 @@ impl ProviderNetwork {
         }
     }
 
+    /// A route and mount support already decided: what a plugin's settings
+    /// or a supplied source say.
+    pub(crate) fn from_parts(
+        host_address: Result<Option<String>, String>,
+        supports_host_workspace: bool,
+    ) -> Self {
+        Self {
+            host_address,
+            supports_host_workspace,
+        }
+    }
+
     pub(crate) fn host_address(&self) -> Result<Option<String>, String> {
         self.host_address.clone()
     }
@@ -190,14 +202,9 @@ impl InProcessProviders {
         self
     }
 
-    /// The factory for `kind`.
-    pub(crate) fn factory(&self, kind: &str) -> Result<Arc<dyn ProviderFactory>, String> {
-        self.factories.get(kind).cloned().ok_or_else(|| {
-            format!(
-                "the {kind} provider is not configured in this process, and no provider plugin \
-                 is launched when built-in providers are linked in"
-            )
-        })
+    /// Every factory, by kind.
+    pub(crate) fn into_factories(self) -> BTreeMap<String, Arc<dyn ProviderFactory>> {
+        self.factories
     }
 }
 
