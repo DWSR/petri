@@ -282,7 +282,7 @@ impl SandboxExecutor {
             gate: self.gate.clone(),
         };
         let teardown = SandboxTeardown {
-            host,
+            provider: self.manager.source().kind().to_owned(),
             sandbox: acquired.into_sandbox(),
             lease,
             standalone,
@@ -627,7 +627,8 @@ fn docker_provider_config(
 /// What release needs: the lease the environment held, and whether this
 /// executor alone owns it.
 pub(crate) struct SandboxTeardown {
-    host:       bool,
+    /// The provider kind that acquired the sandbox: where release goes.
+    provider:   String,
     sandbox:    Arc<dyn Sandbox>,
     lease:      SandboxLeaseId,
     /// No coordinator named the lease: the sandbox ends with the scope.
@@ -637,7 +638,7 @@ pub(crate) struct SandboxTeardown {
 impl fmt::Debug for SandboxTeardown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SandboxTeardown")
-            .field("host", &self.host)
+            .field("provider", &self.provider)
             .field("sandbox", &self.sandbox.id())
             .field("lease", &self.lease)
             .field("standalone", &self.standalone)
