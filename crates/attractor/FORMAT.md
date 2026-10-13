@@ -126,11 +126,11 @@ Nms` and class `timeout`; the human gate's timeout is its answer deadline (see
 "Steps at run time"); the ACP agent hands the deadline to its turn. The
 driver arms no timer of its own around those steps, so a human gate's 30 day
 default is not an answer deadline. Every other node, including a native
-`backend="api"` agent and a `tab` prompt on it, is `ExecutorEnforced`: the
-driver's timer counts active work only, stops while the step has a question
-pending with the host, and resumes with the remaining time when the last
-pending question is answered. A sibling's question never extends another
-stage's budget. On expiry the driver cancels the step (for a native agent,
+`backend="api"` agent (also the default when no backend is set) and a `tab`
+prompt on it, is `ExecutorEnforced`: the driver's timer counts active work
+only, stops while the step has a question pending with the host, and resumes
+with the remaining time when the last pending question is answered. A
+sibling's question never extends another stage's budget. On expiry the driver cancels the step (for a native agent,
 through Pebble's prompt cancellation token; Pebble's own wall-clock timer stays
 unset). The attempt is `timed_out` and a retry gets a fresh budget.
 
