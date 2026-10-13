@@ -60,16 +60,16 @@ impl Prompt {
                 before,
                 text,
                 after,
-            } => CodingInput::text(text)
-                .with_context(context_content(before), context_content(after)),
+            } => CodingInput::from(prompt_content(text))
+                .with_context(prompt_content(before), prompt_content(after)),
             Self::Generated(text) => CodingInput::text(text).without_skill_expansion(),
         }
     }
 }
 
-/// An absent preamble or suffix must not become an empty text block:
+/// An absent prompt segment must not become an empty text block:
 /// providers such as Anthropic reject those blocks, including on fallback.
-fn context_content(text: String) -> InputContent {
+fn prompt_content(text: String) -> InputContent {
     if text.is_empty() {
         InputContent::default()
     } else {

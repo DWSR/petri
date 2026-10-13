@@ -1171,14 +1171,17 @@ async fn delivered_follow_ups_expand_only_intentional_leading_commands() {
 /// particular, Anthropic rejects such blocks after a cross-provider fallback.
 #[tokio::test]
 async fn native_prompts_omit_absent_context_parts() {
-    for fidelity in ["compact", "full"] {
+    for (fidelity, authored) in [
+        ("compact", "Make the change and verify it"),
+        ("full", "Make the change and verify it"),
+        ("compact", ""),
+    ] {
         let dir = RunDir::new("pebble-absent-context");
         let (client, provider) =
             scripted_client(vec![ScriptedCall::response(text_response("done"))]);
-        let report = runtime(&dir, client)
-            .run(graph(&format!(r#", fidelity="{fidelity}""#)))
-            .await
-            .expect("replay");
+        let mut graph = graph(&format!(r#", fidelity="{fidelity}""#));
+        node_config(&mut graph, "a")["prompt"] = json!(authored);
+        let report = runtime(&dir, client).run(graph).await.expect("replay");
         assert_eq!(
             report.status,
             RunStatus::Success,
@@ -1195,9 +1198,9 @@ async fn native_prompts_omit_absent_context_parts() {
             "{fidelity} must not emit empty context blocks: {sent:?}"
         );
         let text = message_text(sent);
-        assert!(text.contains("Make the change and verify it"));
+        assert!(text.contains(authored));
         if fidelity == "full" {
-            assert_eq!(text, "Make the change and verify it");
+            assert_eq!(text, authored);
         } else {
             assert!(
                 text.contains("Goal:"),
