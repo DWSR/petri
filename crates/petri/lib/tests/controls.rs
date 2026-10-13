@@ -20,7 +20,7 @@ use petri::execution::events::{
 };
 use petri::execution::host::{self, HostRun};
 use petri::execution::inspect::inspect_run_dir;
-use petri::execution::watchdog::StallWatchdog;
+use petri::execution::watchdog::{StallWatchdog, WatchdogTask};
 use petri::execution::{
     CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, ExecutionObserver,
     InterviewDispatcher, InterviewReply, InterviewRequest, Interviewer,
@@ -433,7 +433,10 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
 
 /// A pause parks the watchdog: a run paused far longer than its stall
 /// budget, with nothing running, is not a stall, and it finishes once
-/// unpaused.
+/// unpaused. The watchdog is stopped before the unpause: what the step
+/// then takes to launch its sandbox is wall-clock time under test load,
+/// not idleness, and the budget is not for measuring it. An unpause
+/// restarting the full budget is the watchdog's own unit test.
 #[tokio::test]
 async fn a_pause_parks_the_watchdog() {
     const IDLE_WHEN_PAUSED: &str = r#"digraph G {
@@ -453,20 +456,20 @@ async fn a_pause_parks_the_watchdog() {
         .observe(Arc::new(watchdog.clone()));
     controls.pause();
     let paused = controls.clone();
-    let mut task = None;
+    let monitor = watchdog.clone();
     let report = host::run_configured(&rt, host_run, |handle, _| {
         paused.wire(handle.clone());
-        task = Some(watchdog.start(handle));
+        let task = monitor.start(handle);
         let paused = paused.clone();
         tokio::spawn(async move {
             // Three budgets paused, with nothing running.
             sleep(Duration::from_millis(1200)).await;
+            task.stop().await;
             paused.unpause().await;
         });
     })
     .await
     .expect("the run completes");
-    task.expect("started").stop().await;
     assert!(watchdog.tripped().is_none(), "a paused run is not stalled");
     assert_eq!(
         report.status,
@@ -478,6 +481,8 @@ async fn a_pause_parks_the_watchdog() {
 
 /// A pending question parks the watchdog: a gate that waits far longer than
 /// the stall budget is not a stall, and the run continues once answered.
+/// The answer stops the watchdog first, for the same reason the pause test
+/// does: the step's sandbox launch is not idleness.
 #[tokio::test]
 async fn a_pending_question_parks_the_watchdog() {
     const GATED: &str = r#"digraph G {
@@ -490,12 +495,19 @@ async fn a_pending_question_parks_the_watchdog() {
         gate -> go [label="[Y] Yes"]
         go -> exit
     }"#;
-    struct Slow;
+    /// Answers after three budgets, stopping the watchdog it is handed first.
+    struct Slow(Mutex<Option<WatchdogTask>>);
     #[async_trait::async_trait]
     impl Interviewer for Slow {
         async fn reply(&self, _: InterviewRequest, cancel: CancellationToken) -> InterviewReply {
             tokio::select! {
-                () = sleep(Duration::from_secs(3)) => InterviewReply::Answered(Answer::choice("Y")),
+                () = sleep(Duration::from_secs(3)) => {
+                    let task = self.0.lock().expect("the watchdog task").take();
+                    if let Some(task) = task {
+                        task.stop().await;
+                    }
+                    InterviewReply::Answered(Answer::choice("Y"))
+                }
                 () = cancel.cancelled() => InterviewReply::Cancelled,
             }
         }
@@ -505,18 +517,17 @@ async fn a_pending_question_parks_the_watchdog() {
     let lowered = lower(&rt, &dir, GATED);
     let graph = lowered.graph.expect("lowers");
     let watchdog = StallWatchdog::new(graph.policy.stall_timeout.expect("a budget"));
-    let dispatcher = InterviewDispatcher::new(Arc::new(Slow));
+    let slow = Arc::new(Slow(Mutex::new(None)));
+    let dispatcher = InterviewDispatcher::new(slow.clone());
     let host_run = HostRun::new(graph)
         .observe(Arc::new(watchdog.clone()))
         .observe(Arc::new(dispatcher.clone()));
-    let mut task = None;
     let report = host::run_configured(&rt, host_run, |handle, secrets| {
         dispatcher.wire(handle.clone(), secrets);
-        task = Some(watchdog.start(handle));
+        *slow.0.lock().expect("the watchdog task") = Some(watchdog.start(handle));
     })
     .await
     .expect("the run completes");
-    task.expect("started").stop().await;
     let receipt = dispatcher.shutdown().await;
     assert!(
         watchdog.tripped().is_none(),
