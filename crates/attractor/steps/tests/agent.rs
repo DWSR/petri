@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use attractor_steps::contract::Contract;
 use attractor_steps::register;
 use frontend_attractor::load;
 use runtime::driver::ExecutionReport;
@@ -366,4 +367,45 @@ async fn an_acp_turn_that_outlives_the_node_timeout_is_retried_then_fails() {
         Attempt::FIRST.next(),
         "the timeout was retried once before the node failed"
     );
+}
+
+#[tokio::test]
+async fn acp_receives_the_same_single_assembled_text_block() {
+    let dir = RunDir::new("acp-authored-context");
+    let agent = fake_agent(&dir);
+    let record = dir.path().join("prompt.json");
+    let mut graph = lower(&agent_dot(&agent, r#", fidelity="truncate""#));
+    let config = &mut graph
+        .body
+        .nodes
+        .iter_mut()
+        .find(|node| node.name == "a")
+        .expect("agent")
+        .step
+        .config;
+    config["prompt"] = json!("/commit authored task");
+    config["item_data"] = json!("item /tmp");
+    // The fake agent's prose fails this contract, after recording the first
+    // turn. Disable repairs so the captured wire input is that first turn.
+    config["output_schema"] = json!("routing");
+    config["output_retries"] = json!(0);
+    let graph = with_env(graph, &[(
+        "ACP_PROMPT_RECORD",
+        record.to_str().expect("path"),
+    )]);
+    let report = runtime(&dir).run(graph).await.expect("replay");
+    assert_eq!(output_of(&report, "a")["failure_class"], "bad_output");
+    let request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record).expect("wire request")).expect("JSON");
+    let run_id = dir
+        .path()
+        .file_name()
+        .expect("run id")
+        .to_str()
+        .expect("UTF-8");
+    let expected = format!(
+        "Goal: Greet\nRun ID: {run_id}\n\n\n/commit authored task\n\nitem /tmp{}",
+        Contract::Routing.prompt_suffix()
+    );
+    assert_eq!(request["prompt"], json!([{"type":"text", "text":expected}]));
 }

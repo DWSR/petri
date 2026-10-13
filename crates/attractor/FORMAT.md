@@ -1324,10 +1324,19 @@ Pebble discovers `*/SKILL.md` in each directory, a later directory
 overriding an earlier name, lists the result under `# Available Skills` in
 the system prompt (Fabro's text), registers the skill tool (`use_skill`
 with `skill_name` for Fabro's own and the Codex vocabulary; `Skill` with
-`skill` and `args` for Claude 5 and Kimi Code), expands one `/name`
-reference in the node's prompt into the template, and serves a tool call
-with the template. A session that discovers no skills offers no tool and no
-section. A prompt that names a skill the session does not have fails the
+`skill` and `args` for Claude 5 and Kimi Code), and serves a tool call
+with the template. On the native backend, a `/name` command expands only
+at the beginning of the authored node prompt, after leading whitespace.
+Later slash tokens remain arguments or ordinary text. Petri keeps the
+fidelity preamble, `for_each` item data, and output contract outside that
+expansion. They remain present even when a template has no `{{user_input}}`
+placeholder and replaces the authored prompt. Generated output-repair
+messages bypass expansion; user-delivered follow-ups retain leading-command
+support. ACP receives the same assembled text as before, and its agent
+owns any command interpretation. One-shot prompt nodes do not expand skills.
+
+A session that discovers no skills offers no tool and no section. With
+skills discovered, a leading command naming an unknown skill fails the
 node with class `skill_missing` and the reason
 `expanding a skill reference: Unknown skill: /name`. The reference cases
 live in `crates/fabro/acceptance/testdata/skills`.

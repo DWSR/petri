@@ -445,16 +445,14 @@ impl NativeSession {
     /// the turn and reports each move on its stream.
     pub(crate) async fn prompt(
         &mut self,
-        prompt: &str,
+        input: CodingInput,
         control: &mut mpsc::Receiver<Control>,
     ) -> Result<String, AgentError> {
         let questions = self.questions.clone();
         let cancel = self.cancel.clone();
         let kill = self.kill.clone();
         let report = {
-            let prompt = self
-                .agent
-                .prompt_with_cancellation(CodingInput::text(prompt), &cancel);
+            let prompt = self.agent.prompt_with_cancellation(input, &cancel);
             tokio::pin!(prompt);
             let mut closed = false;
             // A plain interrupt parked the prompt: the next delivered text

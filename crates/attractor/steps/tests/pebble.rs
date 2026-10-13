@@ -5,9 +5,11 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use attractor_steps::parallel::fenced_item;
 use attractor_steps::pebble::PebbleClient;
 use attractor_steps::pebble::environment::PebbleEnvironment;
 use attractor_steps::register;
+use attractor_steps::skills::FabroHome;
 use frontend::Diagnostics;
 use frontend_attractor::RunSettings;
 use frontend_attractor::mcps::{DEFAULT_TOOL_TIMEOUT_MS, McpServer, McpTransport};
@@ -15,7 +17,8 @@ use ir::{CancelScopeId, Graph, RunStatus, ScopeId};
 use lithos_llm::types::ReasoningEffort;
 use pebble_coding_agent::environment::{Environment, ExecRequest};
 use pebble_coding_agent::test_support::{
-    EnvironmentContract, ScriptedCall, scripted_client, text_response, tool_call_response,
+    EnvironmentContract, ScriptedCall, message_text, scripted_client, text_response,
+    tool_call_response,
 };
 use runtime::driver::{
     DeliverDisposition, EventObserver, ExecutionReport, ObserveError, RunHandle,
@@ -910,4 +913,256 @@ async fn the_driver_deadline_cancels_a_native_attempt_through_its_token() {
     );
     assert_eq!(metrics(&report)["pebble.usage"]["tokens"]["input"], 10);
     assert_eq!(metrics(&report)["pebble.prompts"], 1);
+}
+
+/// A template without a placeholder would discard the entire assembled
+/// workflow input if Petri failed to keep the authored segment separate.
+async fn commit_skill(dir: &RunDir, graph: &mut Graph, node: &str) {
+    let skills = dir.path().join("skill-fixtures");
+    fs::create_dir_all(skills.join("commit"))
+        .await
+        .expect("skill directory");
+    fs::write(
+        skills.join("commit/SKILL.md"),
+        "---\nname: commit\ndescription: Test commit instructions\n---\nCOMMIT TEMPLATE SENTINEL\n",
+    )
+    .await
+    .expect("skill template");
+    node_config(graph, node)["skill_dirs"] = json!([skills]);
+}
+
+fn activated_skills(report: &ExecutionReport, node: &str) -> Vec<Value> {
+    report
+        .state
+        .log
+        .events()
+        .filter_map(|event| match event {
+            Event::StepProgressRecorded {
+                ev: ir::StepEvent::Custom(value),
+                ..
+            } if value["kind"] == "pebble" && value["node"] == node => {
+                value["event"]["event"].get("SkillActivated").cloned()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+// Regression scenarios reported by denkhaus in fabro-sh/fabro#784.
+async fn check_native_skill_context(prior: &str, authored: &str, activates: bool) {
+    let dir = RunDir::new("pebble-skill-context");
+    let source = r#"digraph T {
+        graph [backend="api", default_model="test/model", goal="Keep workflow context"]
+        start [shape=Mdiamond]
+        prior [prompt="Report the previous result"]
+        a [prompt="placeholder", fidelity="summary:high"]
+        exit [shape=Msquare]
+        start -> prior -> a -> exit
+    }"#;
+    let mut graph = frontend_attractor::load("test.fabro", source, &NoFiles, &CompileInputs::new())
+        .graph
+        .expect("valid workflow");
+    commit_skill(&dir, &mut graph, "a").await;
+    let config = node_config(&mut graph, "a");
+    config["prompt"] = json!(authored);
+    // This is the fenced value the for_each branch hands to its target.
+    let item = fenced_item(&json!("/commit item /tmp"));
+    config["item_data"] = json!(item);
+    config["output_schema"] = json!({"type":"object", "description":"Contract /commit /tmp"});
+    let (client, provider) = scripted_client(vec![
+        ScriptedCall::response(text_response(prior)),
+        ScriptedCall::response(text_response("{}")),
+    ]);
+    let report = runtime(&dir, client)
+        .capability(FabroHome(dir.path().join("fabro-home")))
+        .run(graph)
+        .await
+        .expect("replay");
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let sent = message_text(requests[1].messages().last().expect("user message"));
+    assert!(sent.contains(prior), "prior context remains: {sent}");
+    assert!(
+        sent.contains("Keep workflow context"),
+        "goal remains: {sent}"
+    );
+    assert!(sent.contains(&item), "item remains: {sent}");
+    assert!(
+        sent.contains("Fabro final-output contract"),
+        "contract remains: {sent}"
+    );
+    assert!(
+        sent.contains("Contract /commit /tmp"),
+        "schema remains: {sent}"
+    );
+    let activations = activated_skills(&report, "a");
+    if activates {
+        assert!(
+            sent.contains("COMMIT TEMPLATE SENTINEL"),
+            "template expanded: {sent}"
+        );
+        assert!(
+            !sent.contains(authored),
+            "template replaces only authored input: {sent}"
+        );
+        assert_eq!(activations, vec![
+            json!({"skill_name":"commit", "source":"slash"})
+        ]);
+        assert!(sent.find(prior) < sent.find("COMMIT TEMPLATE SENTINEL"));
+        assert!(sent.find("COMMIT TEMPLATE SENTINEL") < sent.find(&item));
+    } else {
+        assert!(sent.contains(authored), "authored task remains: {sent}");
+        assert!(
+            !sent.contains("COMMIT TEMPLATE SENTINEL"),
+            "no expansion: {sent}"
+        );
+        assert!(activations.is_empty(), "{activations:?}");
+    }
+}
+
+#[tokio::test]
+async fn native_skill_expansion_ignores_paths_in_prior_context() {
+    check_native_skill_context(
+        "smoke-tested via a /tmp build",
+        "Make the change and verify it",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_skill_expansion_ignores_echoed_failures() {
+    check_native_skill_context(
+        "previous stage failed: unknown skill: /tmp",
+        "Recover the failed stage",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_skill_expansion_ignores_known_commands_in_feedback() {
+    check_native_skill_context(
+        "Reviewer feedback mentions /commit",
+        "Address the reviewer feedback",
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_skill_expansion_preserves_context_around_authored_commands() {
+    check_native_skill_context(
+        "Prior stage result /tmp",
+        "  /commit authored arguments /tmp",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn generated_repairs_preserve_slash_tokens_without_activating_skills() {
+    let dir = RunDir::new("pebble-skill-repair");
+    let mut graph = graph("");
+    commit_skill(&dir, &mut graph, "a").await;
+    node_config(&mut graph, "a")["output_schema"] = json!({
+        "type":"object", "properties":{"answer":{"type":"integer"}}, "required":["answer"]
+    });
+    let (client, provider) = scripted_client(vec![
+        ScriptedCall::response(text_response(r#"{"answer":"/commit unknown skill: /tmp"}"#)),
+        ScriptedCall::response(text_response(r#"{"answer":42}"#)),
+    ]);
+    let report = runtime(&dir, client)
+        .capability(FabroHome(dir.path().join("fabro-home")))
+        .run(graph)
+        .await
+        .expect("replay");
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let repair = message_text(requests[1].messages().last().expect("repair"));
+    assert!(
+        repair.contains("Your previous response did not satisfy the output contract"),
+        "{repair}"
+    );
+    assert!(repair.contains("/commit unknown skill: /tmp"), "{repair}");
+    assert!(activated_skills(&report, "a").is_empty());
+}
+
+#[tokio::test]
+async fn delivered_follow_ups_expand_only_intentional_leading_commands() {
+    for (follow_up, activates) in [
+        ("Check /commit and /tmp as literal examples", false),
+        ("  /commit follow-up arguments /tmp", true),
+    ] {
+        let dir = RunDir::new("pebble-skill-follow-up");
+        let gate = dir.path().join("release");
+        let command = format!("while [[ ! -f '{}' ]]; do sleep 0.01; done", gate.display());
+        let (client, provider) = scripted_client(vec![
+            ScriptedCall::response(tool_call_response(
+                "shell",
+                "gate",
+                json!({"command":command}),
+            )),
+            ScriptedCall::response(text_response("original answer")),
+            ScriptedCall::response(text_response("follow-up answer")),
+        ]);
+        let mut graph = graph("");
+        commit_skill(&dir, &mut graph, "a").await;
+        let (send, mut receive) = mpsc::channel(1);
+        let driver = runtime(&dir, client)
+            .capability(FabroHome(dir.path().join("fabro-home")))
+            .observe(Arc::new(NativeStarted(send)))
+            .driver(graph);
+        let handle = driver.handle();
+        let run = tokio::spawn(driver.run());
+        let firing = timeout(Duration::from_secs(10), receive.recv())
+            .await
+            .expect("native event")
+            .expect("firing");
+        timeout(Duration::from_secs(10), provider.wait_for_call())
+            .await
+            .expect("first model call");
+        assert_eq!(
+            handle
+                .deliver(firing, ir::Control::Deliver(json!({"text":follow_up})))
+                .await,
+            DeliverDisposition::Delivered
+        );
+        fs::write(gate, "go").await.expect("release tool");
+        let report = timeout(Duration::from_secs(15), run)
+            .await
+            .expect("run settles")
+            .expect("task");
+        assert_eq!(
+            report.status,
+            RunStatus::Success,
+            "{:?}",
+            report.state.errors()
+        );
+        assert_eq!(output_of(&report, "a")["text"], "follow-up answer");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        let sent = message_text(requests[2].messages().last().expect("follow-up input"));
+        if activates {
+            assert!(sent.contains("COMMIT TEMPLATE SENTINEL"), "{sent}");
+            assert_eq!(activated_skills(&report, "a"), vec![
+                json!({"skill_name":"commit", "source":"slash"})
+            ]);
+        } else {
+            assert_eq!(sent, follow_up);
+            assert!(activated_skills(&report, "a").is_empty());
+        }
+    }
 }
