@@ -21,6 +21,7 @@ use crate::in_process::{
     InProcessProviders, InProcessSource, ProviderContext, ProviderFactory, ProviderNetwork,
 };
 use crate::plugin::ProviderSource;
+use crate::routing::{ProviderRegistrations, ProviderTransport};
 use crate::{DOCKER_HOST_ALIAS, RUN_LABEL, fingerprint};
 
 /// A provider with a scripted kind and health report; it creates nothing.
@@ -268,19 +269,21 @@ async fn a_shutdown_racing_the_connection_wins() {
 }
 
 #[test]
-fn factories_serve_the_kind_they_build() {
-    let providers = InProcessProviders::new()
-        .with(Arc::new(ScriptedFactory::new("daytona", vec![healthy(
-            None,
-        )])));
+fn linked_factories_serve_the_kind_they_build_and_nothing_else() {
+    let providers = ProviderRegistrations::linked(InProcessProviders::new().with(Arc::new(
+        ScriptedFactory::new("daytona", vec![healthy(None)]),
+    )));
     let missing = providers
-        .factory("docker")
+        .get("docker")
         .err()
-        .expect("no docker factory");
+        .expect("no docker factory, and no plugin in its place");
     assert!(missing.contains("not configured"), "{missing}");
-    assert_eq!(
-        providers.factory("daytona").expect("daytona").kind(),
-        "daytona"
+    assert!(
+        matches!(
+            providers.get("daytona"),
+            Ok(ProviderTransport::Linked(factory)) if factory.kind() == "daytona"
+        ),
+        "the daytona factory serves its kind"
     );
 }
 
