@@ -7,7 +7,7 @@ use std::time::Duration;
 use execution::hooks::{HookPoint, HookServiceHandle};
 use frontend_attractor::kinds::RETRY_REQUESTED_CLASS;
 use ir::{Control, Value};
-use pebble_coding_agent::{CodingAgentExport, CodingInput, ShutdownReason};
+use pebble_coding_agent::{CodingAgentExport, CodingInput, InputContent, ShutdownReason};
 use serde::Deserialize;
 use smol_str::SmolStr;
 use steps::{SECRET_UNAVAILABLE_CLASS, StepCtx};
@@ -60,9 +60,20 @@ impl Prompt {
                 before,
                 text,
                 after,
-            } => CodingInput::text(text).with_context(before, after),
+            } => CodingInput::text(text)
+                .with_context(context_content(before), context_content(after)),
             Self::Generated(text) => CodingInput::text(text).without_skill_expansion(),
         }
+    }
+}
+
+/// An absent preamble or suffix must not become an empty text block:
+/// providers such as Anthropic reject those blocks, including on fallback.
+fn context_content(text: String) -> InputContent {
+    if text.is_empty() {
+        InputContent::default()
+    } else {
+        InputContent::text(text)
     }
 }
 

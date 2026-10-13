@@ -14,7 +14,7 @@ use frontend::Diagnostics;
 use frontend_attractor::RunSettings;
 use frontend_attractor::mcps::{DEFAULT_TOOL_TIMEOUT_MS, McpServer, McpTransport};
 use ir::{CancelScopeId, Graph, RunStatus, ScopeId};
-use lithos_llm::types::ReasoningEffort;
+use lithos_llm::types::{ContentPart, ReasoningEffort};
 use pebble_coding_agent::environment::{Environment, ExecRequest};
 use pebble_coding_agent::test_support::{
     EnvironmentContract, ScriptedCall, message_text, scripted_client, text_response,
@@ -1163,6 +1163,46 @@ async fn delivered_follow_ups_expand_only_intentional_leading_commands() {
         } else {
             assert_eq!(sent, follow_up);
             assert!(activated_skills(&report, "a").is_empty());
+        }
+    }
+}
+
+/// Empty context is absence, not an empty provider text block. In
+/// particular, Anthropic rejects such blocks after a cross-provider fallback.
+#[tokio::test]
+async fn native_prompts_omit_absent_context_parts() {
+    for fidelity in ["compact", "full"] {
+        let dir = RunDir::new("pebble-absent-context");
+        let (client, provider) =
+            scripted_client(vec![ScriptedCall::response(text_response("done"))]);
+        let report = runtime(&dir, client)
+            .run(graph(&format!(r#", fidelity="{fidelity}""#)))
+            .await
+            .expect("replay");
+        assert_eq!(
+            report.status,
+            RunStatus::Success,
+            "{:?}",
+            report.state.errors()
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let sent = requests[0].messages().last().expect("user input");
+        assert!(
+            sent.content()
+                .iter()
+                .all(|part| !matches!(part, ContentPart::Text { text } if text.is_empty())),
+            "{fidelity} must not emit empty context blocks: {sent:?}"
+        );
+        let text = message_text(sent);
+        assert!(text.contains("Make the change and verify it"));
+        if fidelity == "full" {
+            assert_eq!(text, "Make the change and verify it");
+        } else {
+            assert!(
+                text.contains("Goal:"),
+                "the nonempty preamble remains: {text}"
+            );
         }
     }
 }
