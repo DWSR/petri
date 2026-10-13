@@ -20,6 +20,7 @@ use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 
 use crate::lease::{LeaseRequest, RecordedLease};
+use crate::run::{LEASE_LABEL, RUN_LABEL};
 use crate::{
     FixedProvider, LeaseLedger, LeaseRecord, LeaseState, LedgerError, LostSandbox, MemoryLedger,
     PendingIntent, RunIdentity, SandboxLeaseManager,
@@ -538,6 +539,72 @@ async fn a_lost_create_is_adopted_and_fenced_at_reconciliation() {
         .expect("acquires the adopted sandbox");
     assert_eq!(again, lost[0]);
     assert_eq!(provider.creates.load(Ordering::SeqCst), 1);
+}
+
+/// A provider reporting another namespace than the run's records were
+/// written in is the wrong place to reconcile: nothing there is this run's
+/// to adopt or remove, however it is labelled. The mismatch is reported and
+/// the provider is left as it was. Once the records agree with the
+/// provider, the same unrecorded resource is swept.
+#[tokio::test]
+async fn a_namespace_mismatch_is_reported_and_nothing_is_swept() {
+    let dir = RunDir::new("reconcile-namespace");
+    let provider = ScriptedProvider::new();
+    // A resource under the run's labels that no record names: in the
+    // run's own namespace, the sweep's target.
+    let mut spec = SandboxSpec::new(sandbox_driver::SandboxSource::Image {
+        reference: "test".into(),
+    });
+    spec.labels.insert(RUN_LABEL.to_owned(), dir.run_id());
+    spec.labels.insert(LEASE_LABEL.to_owned(), "9".to_owned());
+    let unrecorded = provider
+        .create(&spec, None)
+        .await
+        .expect("creates")
+        .id()
+        .clone();
+    let recorded = [RecordedLease {
+        lease:        LEASE,
+        workspace_id: WORKSPACE.to_owned(),
+    }];
+
+    // The run's lease is recorded live in another namespace.
+    let elsewhere = Arc::new(MemoryLedger::default());
+    let mismatched = build_manager(&dir, &provider, elsewhere.clone());
+    let current = mismatched.source().fingerprint().to_owned();
+    elsewhere
+        .allocating(LEASE, "scripted", "scripted:elsewhere")
+        .await
+        .expect("records");
+    elsewhere
+        .live(LEASE, "box-elsewhere")
+        .await
+        .expect("records");
+    let report = mismatched.reconcile(&recorded).await;
+    assert_eq!(report.problems.len(), 1, "{report:?}");
+    assert!(
+        report.problems[0].contains("scripted:elsewhere") && report.problems[0].contains(&current),
+        "{report:?}"
+    );
+    assert!(report.adopted.is_empty());
+    assert!(report.removed.is_empty());
+    assert_eq!(
+        provider.ids(),
+        vec![unrecorded.clone()],
+        "nothing was removed"
+    );
+
+    // Recorded in this provider's namespace, the sweep runs.
+    let here = Arc::new(MemoryLedger::default());
+    let matching = build_manager(&dir, &provider, here.clone());
+    here.allocating(LEASE, "scripted", &current)
+        .await
+        .expect("records");
+    here.live(LEASE, "box-elsewhere").await.expect("records");
+    let report = matching.reconcile(&recorded).await;
+    assert!(report.is_clean(), "{report:?}");
+    assert_eq!(report.removed, vec![unrecorded]);
+    assert!(provider.ids().is_empty());
 }
 
 /// A release that keeps its sandbox, finding it gone from the provider,
