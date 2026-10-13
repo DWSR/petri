@@ -909,15 +909,45 @@ impl SandboxLeaseManager {
         Ok(ids)
     }
 
+    /// Every recorded lease's fingerprint against the provider's, before
+    /// reconciliation changes anything. A lease with no fingerprint never
+    /// sent a create, so it has nothing on any provider and cannot
+    /// disagree. The problems are every mismatch found, and any record that
+    /// could not be read: an unread record cannot vouch for the namespace
+    /// either.
+    async fn verify_namespace(&self, leases: &[RecordedLease]) -> Result<(), Vec<String>> {
+        let mut problems = Vec::new();
+        for recorded in leases {
+            match self.ledger.lookup(recorded.lease).await {
+                Ok(Some(record)) => {
+                    if let Err(error) = self.check_fingerprint(recorded.lease, &record) {
+                        problems.push(error.to_string());
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => problems.push(error.to_string()),
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems)
+        }
+    }
+
     /// Reconcile the run's leases with the provider before any create: the
-    /// takeover step of a `Write` open. For each lease recorded `allocating`
-    /// with a create attempted (a fingerprint), a resource under its
-    /// workspace label is the lost create's: it is adopted (attached,
-    /// fenced with one stop and one start, recorded live). Then every
-    /// resource under the run's label that no record names by resource id
-    /// is garbage — a stale owner's late create, whose `live` write was
-    /// refused — and is removed. Invariant afterwards: a resource under the
-    /// run's labels is named by a live or stopped record.
+    /// takeover step of a `Write` open. First every recorded lease's
+    /// fingerprint is checked against the provider's: the run's records
+    /// name the namespace its resources live in, and a provider that
+    /// reports another one is the wrong place to adopt or remove anything,
+    /// so a mismatch is reported and nothing below runs. Then, for each
+    /// lease recorded `allocating` with a create attempted (a fingerprint),
+    /// a resource under its workspace label is the lost create's: it is
+    /// adopted (attached, fenced with one stop and one start, recorded
+    /// live). Then every resource under the run's label that no record
+    /// names by resource id is garbage — a stale owner's late create, whose
+    /// `live` write was refused — and is removed. Invariant afterwards: a
+    /// resource under the run's labels is named by a live or stopped record.
     pub async fn reconcile(&self, leases: &[RecordedLease]) -> ReconcileReport {
         let mut report = ReconcileReport::default();
         let (provider, generation) = match self.source.current().await {
@@ -926,6 +956,10 @@ impl SandboxLeaseManager {
                 return report.with_problem(format!("sandbox provider unavailable: {error}"));
             }
         };
+        if let Err(problems) = self.verify_namespace(leases).await {
+            report.problems = problems;
+            return report;
+        }
         for recorded in leases {
             let slot = self.slot(recorded.lease);
             let mut slot = slot.lock().await;
@@ -942,10 +976,6 @@ impl SandboxLeaseManager {
                 || record.pending.is_some()
                 || slot.live.is_some()
             {
-                continue;
-            }
-            if let Err(error) = self.check_fingerprint(recorded.lease, &record) {
-                report.problems.push(error.to_string());
                 continue;
             }
             let label = self.identity.workspace_label(&recorded.workspace_id);
