@@ -26,7 +26,7 @@ use std::env;
 use std::time::{Duration, Instant};
 
 pub use backend::AgentBackend;
-use backend::{AgentError, Session};
+use backend::{AgentError, Prompt, Session};
 use execution::ExecutionIdentity;
 use execution::controls::LiveTurns;
 use frontend_attractor::Policy;
@@ -234,8 +234,9 @@ impl AgentConfig {
     }
 
     /// The prompt as the agent receives it: the preamble for `fidelity`,
-    /// the node's prompt, the contract.
-    pub fn assemble(&self, fidelity: Fidelity, run_id: &str, contract: &Contract) -> String {
+    /// the node's prompt, the contract. The node's prompt stays separate so
+    /// only it is open to skill expansion.
+    fn session_prompt(&self, fidelity: Fidelity, run_id: &str, contract: &Contract) -> Prompt {
         let stages: Vec<StageInfo> = fidelity::stages(&self.stages);
         let preamble = Preamble {
             goal: &self.goal,
@@ -244,16 +245,20 @@ impl AgentConfig {
             nodes: &self.nodes,
             kv: &self.kv,
         };
-        let mut body = self.prompt.clone();
+        let before = preamble.prefix(fidelity);
+        let mut after = String::new();
         if let Some(item) = self.item_data.as_deref().filter(|item| !item.is_empty()) {
             // A `for_each` branch's item follows the prompt, as Fabro renders
             // the target for one item.
-            body.push_str("\n\n");
-            body.push_str(item);
+            after.push_str("\n\n");
+            after.push_str(item);
         }
-        let mut out = preamble.prompt(fidelity, &body);
-        out.push_str(&contract.prompt_suffix());
-        out
+        after.push_str(&contract.prompt_suffix());
+        Prompt::Authored {
+            before,
+            text: self.prompt.clone(),
+            after,
+        }
     }
 
     /// The `provider/model` selector a native session runs on.
@@ -515,7 +520,7 @@ async fn run_session(
     session: &mut Session,
     turn_count: &mut u64,
 ) -> Result<Stage, AgentError> {
-    let mut prompt = config.assemble(fidelity, run_id, contract);
+    let mut prompt = config.session_prompt(fidelity, run_id, contract);
     let mut repairs = 0_u64;
     // Each turn is marked live for the control service while it runs, so a
     // host's interrupt finds it; a driver built outside the coordinator has
@@ -534,7 +539,7 @@ async fn run_session(
         };
         let text = session
             .prompt(
-                &prompt,
+                prompt,
                 &mut ctx.control,
                 ctx.env.grace(),
                 config.timeout_ms.map(Duration::from_millis),
@@ -553,7 +558,7 @@ async fn run_session(
                         format!("the response does not meet the output contract ({problem}); repair turn {repairs}"),
                     )
                     .await;
-                prompt = repair_message(&problem);
+                prompt = Prompt::Generated(repair_message(&problem));
             }
             Err(problem) => {
                 return Err(AgentError::failed(

@@ -196,12 +196,19 @@ impl Preamble<'_> {
     /// The prompt an LLM node sends: the preamble, a blank line, the node's
     /// prompt. A `full` node sends the prompt alone.
     pub fn prompt(&self, fidelity: Fidelity, prompt: &str) -> String {
-        let preamble = self.render(fidelity);
-        if preamble.is_empty() {
-            prompt.to_owned()
-        } else {
-            format!("{preamble}\n\n{prompt}")
+        let mut out = self.prefix(fidelity);
+        out.push_str(prompt);
+        out
+    }
+
+    /// What precedes the node's prompt: the preamble and a blank line, or
+    /// nothing for `full`.
+    pub fn prefix(&self, fidelity: Fidelity) -> String {
+        let mut preamble = self.render(fidelity);
+        if !preamble.is_empty() {
+            preamble.push_str("\n\n");
         }
+        preamble
     }
 
     /// The completed stages, in declaration order then by name.

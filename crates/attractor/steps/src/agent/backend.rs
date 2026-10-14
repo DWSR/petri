@@ -7,7 +7,7 @@ use std::time::Duration;
 use execution::hooks::{HookPoint, HookServiceHandle};
 use frontend_attractor::kinds::RETRY_REQUESTED_CLASS;
 use ir::{Control, Value};
-use pebble_coding_agent::{CodingAgentExport, ShutdownReason};
+use pebble_coding_agent::{CodingAgentExport, CodingInput, InputContent, ShutdownReason};
 use serde::Deserialize;
 use smol_str::SmolStr;
 use steps::{SECRET_UNAVAILABLE_CLASS, StepCtx};
@@ -29,6 +29,56 @@ pub enum AgentBackend {
     Acp,
     #[default]
     Api,
+}
+
+/// The authored command is separate from workflow data. ACP still receives
+/// their concatenation; only the native session expands skills.
+pub(crate) enum Prompt {
+    Authored {
+        before: String,
+        text:   String,
+        after:  String,
+    },
+    Generated(String),
+}
+
+impl Prompt {
+    fn assembled(self) -> String {
+        match self {
+            Self::Authored {
+                mut before,
+                text,
+                after,
+            } => {
+                before.push_str(&text);
+                before.push_str(&after);
+                before
+            }
+            Self::Generated(text) => text,
+        }
+    }
+
+    fn into_coding_input(self) -> CodingInput {
+        match self {
+            Self::Authored {
+                before,
+                text,
+                after,
+            } => CodingInput::from(prompt_content(text))
+                .with_context(prompt_content(before), prompt_content(after)),
+            Self::Generated(text) => CodingInput::text(text).without_skill_expansion(),
+        }
+    }
+}
+
+/// An absent prompt segment must not become an empty text block:
+/// providers such as Anthropic reject those blocks, including on fallback.
+fn prompt_content(text: String) -> InputContent {
+    if text.is_empty() {
+        InputContent::default()
+    } else {
+        InputContent::text(text)
+    }
 }
 
 pub(crate) enum Session {
@@ -155,14 +205,15 @@ impl Session {
     /// ignores it; the driver's interview-aware timer owns that deadline.
     pub(crate) async fn prompt(
         &mut self,
-        text: &str,
+        prompt: Prompt,
         control: &mut mpsc::Receiver<Control>,
         grace: Duration,
         deadline: Option<Duration>,
     ) -> Result<String, AgentError> {
         match self {
             Self::Acp(client) => {
-                let turn = client.prompt(text, control, grace);
+                let text = prompt.assembled();
+                let turn = client.prompt(&text, control, grace);
                 let result = match deadline {
                     Some(deadline) => timeout(deadline, turn).await.ok(),
                     None => Some(turn.await),
@@ -180,7 +231,7 @@ impl Session {
                 };
                 result.map(|turn| turn.text).map_err(Into::into)
             }
-            Self::Pebble(session) => session.prompt(text, control).await,
+            Self::Pebble(session) => session.prompt(prompt.into_coding_input(), control).await,
         }
     }
     /// The native session's fallback plan at the route it reached, after
