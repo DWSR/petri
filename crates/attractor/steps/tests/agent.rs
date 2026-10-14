@@ -374,7 +374,12 @@ async fn acp_receives_the_same_single_assembled_text_block() {
     let dir = RunDir::new("acp-authored-context");
     let agent = fake_agent(&dir);
     let record = dir.path().join("prompt.json");
-    let mut graph = lower(&agent_dot(&agent, r#", fidelity="truncate""#));
+    // The fake agent's prose fails the routing contract, after recording the
+    // first turn. Disabling repairs makes the captured wire input that turn.
+    let mut graph = lower(&agent_dot(
+        &agent,
+        r#", fidelity="truncate", output_schema="routing", output_retries=0"#,
+    ));
     let config = &mut graph
         .body
         .nodes
@@ -385,15 +390,11 @@ async fn acp_receives_the_same_single_assembled_text_block() {
         .config;
     config["prompt"] = json!("/commit authored task");
     config["item_data"] = json!("item /tmp");
-    // The fake agent's prose fails this contract, after recording the first
-    // turn. Disable repairs so the captured wire input is that first turn.
-    config["output_schema"] = json!("routing");
-    config["output_retries"] = json!(0);
     let graph = with_env(graph, &[(
         "ACP_PROMPT_RECORD",
         record.to_str().expect("path"),
     )]);
-    let report = runtime(&dir).run(graph).await.expect("replay");
+    let report = run(&dir, graph).await;
     assert_eq!(output_of(&report, "a")["failure_class"], "bad_output");
     let request: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(record).expect("wire request")).expect("JSON");

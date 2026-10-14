@@ -43,13 +43,17 @@ pub(crate) enum Prompt {
 }
 
 impl Prompt {
-    pub(crate) fn assembled(self) -> String {
+    fn assembled(self) -> String {
         match self {
             Self::Authored {
-                before,
+                mut before,
                 text,
                 after,
-            } => format!("{before}{text}{after}"),
+            } => {
+                before.push_str(&text);
+                before.push_str(&after);
+                before
+            }
             Self::Generated(text) => text,
         }
     }

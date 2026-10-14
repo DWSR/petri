@@ -931,6 +931,12 @@ async fn commit_skill(dir: &RunDir, graph: &mut Graph, node: &str) {
     node_config(graph, node)["skill_dirs"] = json!([skills]);
 }
 
+/// A runtime whose Fabro home is isolated, so the developer's own skills
+/// stay out of the session.
+fn skill_runtime(dir: &RunDir, client: lithos_llm::Client) -> Runtime {
+    runtime(dir, client).capability(FabroHome(dir.path().join("fabro-home")))
+}
+
 fn activated_skills(report: &ExecutionReport, node: &str) -> Vec<Value> {
     report
         .state
@@ -948,8 +954,10 @@ fn activated_skills(report: &ExecutionReport, node: &str) -> Vec<Value> {
         .collect()
 }
 
-// Regression scenarios reported by denkhaus in fabro-sh/fabro#784.
-async fn check_native_skill_context(prior: &str, authored: &str, activates: bool) {
+/// The input a node sends after a prior stage, with the item, and the skills
+/// it activated. The workflow context must survive whatever the authored
+/// prompt expands to.
+async fn native_skill_turn(prior: &str, authored: &str) -> (String, String, Vec<Value>) {
     let dir = RunDir::new("pebble-skill-context");
     let source = r#"digraph T {
         graph [backend="api", default_model="test/model", goal="Keep workflow context"]
@@ -973,8 +981,7 @@ async fn check_native_skill_context(prior: &str, authored: &str, activates: bool
         ScriptedCall::response(text_response(prior)),
         ScriptedCall::response(text_response("{}")),
     ]);
-    let report = runtime(&dir, client)
-        .capability(FabroHome(dir.path().join("fabro-home")))
+    let report = skill_runtime(&dir, client)
         .run(graph)
         .await
         .expect("replay");
@@ -1001,69 +1008,65 @@ async fn check_native_skill_context(prior: &str, authored: &str, activates: bool
         sent.contains("Contract /commit /tmp"),
         "schema remains: {sent}"
     );
-    let activations = activated_skills(&report, "a");
-    if activates {
-        assert!(
-            sent.contains("COMMIT TEMPLATE SENTINEL"),
-            "template expanded: {sent}"
-        );
-        assert!(
-            !sent.contains(authored),
-            "template replaces only authored input: {sent}"
-        );
-        assert_eq!(activations, vec![
-            json!({"skill_name":"commit", "source":"slash"})
-        ]);
-        assert!(sent.find(prior) < sent.find("COMMIT TEMPLATE SENTINEL"));
-        assert!(sent.find("COMMIT TEMPLATE SENTINEL") < sent.find(&item));
-    } else {
-        assert!(sent.contains(authored), "authored task remains: {sent}");
-        assert!(
-            !sent.contains("COMMIT TEMPLATE SENTINEL"),
-            "no expansion: {sent}"
-        );
-        assert!(activations.is_empty(), "{activations:?}");
-    }
+    (sent, item, activated_skills(&report, "a"))
+}
+
+// Regression scenarios reported by denkhaus in fabro-sh/fabro#784.
+async fn check_no_expansion(prior: &str, authored: &str) {
+    let (sent, _, activations) = native_skill_turn(prior, authored).await;
+    assert!(sent.contains(authored), "authored task remains: {sent}");
+    assert!(
+        !sent.contains("COMMIT TEMPLATE SENTINEL"),
+        "no expansion: {sent}"
+    );
+    assert!(activations.is_empty(), "{activations:?}");
 }
 
 #[tokio::test]
 async fn native_skill_expansion_ignores_paths_in_prior_context() {
-    check_native_skill_context(
+    check_no_expansion(
         "smoke-tested via a /tmp build",
         "Make the change and verify it",
-        false,
     )
     .await;
 }
 
 #[tokio::test]
 async fn native_skill_expansion_ignores_echoed_failures() {
-    check_native_skill_context(
+    check_no_expansion(
         "previous stage failed: unknown skill: /tmp",
         "Recover the failed stage",
-        false,
     )
     .await;
 }
 
 #[tokio::test]
 async fn native_skill_expansion_ignores_known_commands_in_feedback() {
-    check_native_skill_context(
+    check_no_expansion(
         "Reviewer feedback mentions /commit",
         "Address the reviewer feedback",
-        false,
     )
     .await;
 }
 
 #[tokio::test]
 async fn native_skill_expansion_preserves_context_around_authored_commands() {
-    check_native_skill_context(
-        "Prior stage result /tmp",
-        "  /commit authored arguments /tmp",
-        true,
-    )
-    .await;
+    let prior = "Prior stage result /tmp";
+    let authored = "  /commit authored arguments /tmp";
+    let (sent, item, activations) = native_skill_turn(prior, authored).await;
+    assert!(
+        sent.contains("COMMIT TEMPLATE SENTINEL"),
+        "template expanded: {sent}"
+    );
+    assert!(
+        !sent.contains(authored),
+        "template replaces only authored input: {sent}"
+    );
+    assert_eq!(activations, vec![
+        json!({"skill_name":"commit", "source":"slash"})
+    ]);
+    assert!(sent.find(prior) < sent.find("COMMIT TEMPLATE SENTINEL"));
+    assert!(sent.find("COMMIT TEMPLATE SENTINEL") < sent.find(&item));
 }
 
 #[tokio::test]
@@ -1078,8 +1081,7 @@ async fn generated_repairs_preserve_slash_tokens_without_activating_skills() {
         ScriptedCall::response(text_response(r#"{"answer":"/commit unknown skill: /tmp"}"#)),
         ScriptedCall::response(text_response(r#"{"answer":42}"#)),
     ]);
-    let report = runtime(&dir, client)
-        .capability(FabroHome(dir.path().join("fabro-home")))
+    let report = skill_runtime(&dir, client)
         .run(graph)
         .await
         .expect("replay");
@@ -1121,8 +1123,7 @@ async fn delivered_follow_ups_expand_only_intentional_leading_commands() {
         let mut graph = graph("");
         commit_skill(&dir, &mut graph, "a").await;
         let (send, mut receive) = mpsc::channel(1);
-        let driver = runtime(&dir, client)
-            .capability(FabroHome(dir.path().join("fabro-home")))
+        let driver = skill_runtime(&dir, client)
             .observe(Arc::new(NativeStarted(send)))
             .driver(graph);
         let handle = driver.handle();

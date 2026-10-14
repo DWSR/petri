@@ -234,11 +234,8 @@ impl AgentConfig {
     }
 
     /// The prompt as the agent receives it: the preamble for `fidelity`,
-    /// the node's prompt, the contract.
-    pub fn assemble(&self, fidelity: Fidelity, run_id: &str, contract: &Contract) -> String {
-        self.session_prompt(fidelity, run_id, contract).assembled()
-    }
-
+    /// the node's prompt, the contract. The node's prompt stays separate so
+    /// only it is open to skill expansion.
     fn session_prompt(&self, fidelity: Fidelity, run_id: &str, contract: &Contract) -> Prompt {
         let stages: Vec<StageInfo> = fidelity::stages(&self.stages);
         let preamble = Preamble {
@@ -248,10 +245,7 @@ impl AgentConfig {
             nodes: &self.nodes,
             kv: &self.kv,
         };
-        let mut before = preamble.render(fidelity);
-        if !before.is_empty() {
-            before.push_str("\n\n");
-        }
+        let before = preamble.prefix(fidelity);
         let mut after = String::new();
         if let Some(item) = self.item_data.as_deref().filter(|item| !item.is_empty()) {
             // A `for_each` branch's item follows the prompt, as Fabro renders
