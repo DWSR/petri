@@ -1280,8 +1280,8 @@ const RUN_SECTIONS_IGNORED: &[(&str, &str)] = &[
     ("scm", "SCM metadata is a Fabro platform record"),
     (
         "children",
-        "child-run approval policy is a Fabro platform facility; the standalone runner mounts \
-         `stack.child_workflow` graphs in-process instead",
+        "child-run approval is decided by Fabro's server; the standalone runner starts no child \
+         runs",
     ),
 ];
 
